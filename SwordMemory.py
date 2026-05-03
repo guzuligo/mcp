@@ -174,8 +174,10 @@ class SwordMemory:
                     filtered_result[field] = result[field]
             return filtered_result
 
-        result["all_keywords"] = [result.get("keyword", "")] + (result.get("important_keywords_related") or [])
-        return result
+        # Default: include all fields except summary
+        filtered_result = {k: v for k, v in result.items() if k != "summary"}
+        filtered_result["all_keywords"] = [filtered_result.get("keyword", "")] + (filtered_result.get("important_keywords_related") or [])
+        return filtered_result
 
     def get_summary(self, keyword: str, filename=None) -> dict:
         """Retrieve the summary for a specific memory item."""

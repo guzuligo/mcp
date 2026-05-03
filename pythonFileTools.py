@@ -401,8 +401,8 @@ def read_file_content(
         raise IsADirectoryError(f"Not a file: {file_path}")
 
     content = file_path.read_text(encoding=encoding)
-    lines = content.splitlines(keepends=True)
-    total_lines = len(lines if content.endswith("\n") or not content else len(lines))
+    lines = content.splitlines()
+    total_lines = len(lines)
 
     # Adjust for 1-based indexing; clamp to valid range
     if start_line is not None:
