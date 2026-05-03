@@ -158,7 +158,7 @@ def search_file_content(
 
                 matches.append(match_info)
 
-                if max_results is not None and len(matches >= max_results):
+                if max_results is not None and len(matches) >= max_results:
                     break
 
     return {
@@ -212,6 +212,7 @@ def _apply_changes_to_content(original_content: str, changes: list) -> tuple[str
 
             # Treat empty normalized search as "append to end"
             if norm_search == "":
+                norm_replace = _normalize_ws(replace_str)
                 current_content = current_content + norm_replace
                 applied_changes.append({
                     "index": i,
@@ -223,14 +224,37 @@ def _apply_changes_to_content(original_content: str, changes: list) -> tuple[str
                 })
             else:
                 norm_replace = _normalize_ws(replace_str)
-                parts = []
-                last_end = 0
+
+                def _norm_to_orig_pos(norm_pos, content):
+                    """Convert a position in normalized content to corresponding position in original."""
+                    nc = 0
+                    pos = 0
+                    while pos < len(content) and nc < norm_pos:
+                        if content[pos].isspace():
+                            while pos < len(content) and content[pos].isspace():
+                                pos += 1
+                            nc += 1
+                        else:
+                            nc += 1
+                            pos += 1
+                    return pos
+
+                # Build result by processing each match in normalized content,
+                # converting all positions from normalized to original content coordinates
+                orig_parts = []
+                last_end_norm = 0
                 for m in re.finditer(re.escape(norm_search), norm_content):
-                    parts.append(current_content[last_end:m.end()])
-                    parts.append(norm_replace)
-                    last_end = m.end()
-                parts.append(current_content[last_end:])
-                current_content = "".join(parts)
+                    before_start_orig = _norm_to_orig_pos(last_end_norm, current_content)
+                    before_end_orig = _norm_to_orig_pos(m.start(), current_content)
+
+                    orig_parts.append(current_content[before_start_orig:before_end_orig])
+                    orig_parts.append(norm_replace)
+                    last_end_norm = m.end()
+
+                # Add remaining part after all matches
+                final_before_start = _norm_to_orig_pos(last_end_norm, current_content)
+                orig_parts.append(current_content[final_before_start:])
+                current_content = "".join(orig_parts)
 
                 applied_changes.append({
                     "index": i,
