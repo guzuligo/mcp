@@ -6,7 +6,7 @@ SwordMemory.py
 pythonFileTools.py
 
 To setup, go to mcp.json file and edit it to:
-
+```
 {
   "mcpServers": {
     "python_file_tools": {
@@ -23,3 +23,4 @@ To setup, go to mcp.json file and edit it to:
     }
   }
 }
+```
