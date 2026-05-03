@@ -1,0 +1,53 @@
+SwordMemory is an LLM fastMCP tool to help LLM manage memory.
+
+By default, it stores all memory is usesr home Documents folder in a folder named ".swordmemory"
+The folder can be changed by altering the code as the top code is some configurations including the ".swordmemory" parent directory.
+That folder contains following folders: (Which are created if they don't exists)
+- global: This folder contains global knowledge that can be accessed any time
+- experience: This folder contains subject related experiences
+- reference:  This folder contains document related knowledge, usually aquired when a reference is provided to the LLM.
+
+Each folder contains the following:
+ librarian.json
+  This file keeps track of last updated files, related files in global, experience and reference directories, and a way for LLM to know where to look without the need to look into all the files.
+ [file_name]_[timestamp].json
+  These files contain a file_name, which is related to the knowledge, and the timestamp it was first created.
+  Usually, the librarian.json will only record the file with the largest timestamp.
+
+Following tools should be available to the LLM:
+ save_memory:
+  the saving should have the following format:
+   [[keyword:[title,summary,related_memory_files,important_keywords_related]]]
+   keyword is more like an ID for the idea. It would be good if the LLM provided a good name for it.
+   title is an expressive meaning of this memory item. It should be short to allow skimming over data without reading the summary and reduce token use.
+   summary should contain the experience gained in a way the LLM could refer to without the need to read the whole book or the whole chat where the experience is gained.
+   related_memory_files should be a list of all files that could help understand the experience more.
+   important_keywords_related should contain keywords for lookup. This also should reduce token use as loading the summary is the most expensive one.
+
+  The tool allow choosing which memory type to save:
+   type reference:
+    if there is a document provided, a summary should be added with the user interest in mind during generating it.
+   type experience:
+    if there was a chat with the user where he had to teach the LLM something or correct its behaviour, the idea should be saved there
+   type global:
+    things like the user's name and static facts he shares should be put there. These are usually non-technical and more like a chit-chat friendly.
+
+ librarian_get_files:
+  returns all memory file names that can be used.
+  special parameters should be there to help specify the memory type, or all of them if required.
+
+ get_file:
+  this takes a file and returns all keywords. If specified, following can be retrieved with it: title,related_memory_files and important_keywords_related.
+  also, there should be a variable to specify if an older version of the file is required. zero for recent, and bigger number of older ones. If no file found, inform the LLM that there is no more files.
+ 
+ get_summary:
+  this should help retrieving the summary using the file_name and keyword of the memory.
+  this is the most expensive call as summary would be taking most of the tokens.
+ 
+ search:
+  this should search specific memory, or all memories of nothing specified, for special words in a regex format.
+
+ 
+
+  
+Note that everything is made up of json files so the update implementation becomes easier.
