@@ -1,0 +1,17 @@
+useComfyui.py uses fastMCP to allow LLM's to generate comfyui workflows and send them to comfyui.
+
+It communicates with comfyui. It first requests the connection ip and port from user.
+
+Then, it checks available nodes and models on the server.
+
+The, it generates workflows based on user's request and provide the file path and/or the result in the chat.
+
+Also, user can just request for the workflow without the need to send anything to comfyui.
+
+Available tools:
+- check_comfyui_status: Check if the ComfyUI server is running and accessible at the configured address
+- get_available_nodes: Get all available nodes from ComfyUI (queries /object_info endpoint)
+- generate_workflow: Generate a workflow based on natural language request (returns JSON or sends to ComfyUI)
+- send_workflow: Send an existing workflow JSON to the server
+
+The check_comfyui_status tool should be used first to verify the server is running before generating or sending workflows. This prevents connection errors by confirming the ComfyUI server is reachable at the configured host and port.

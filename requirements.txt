@@ -2,3 +2,5 @@ fastmcp>=3.2.4
 playwright>=1.59.0
 beautifulsoup4>=4.14.3
 httpx>=0.28.1
+
+# useComfyui.py - ComfyUI fastMCP tool dependencies (already covered by httpx + fastmcp)

@@ -1,4 +1,4 @@
-This is an experimental tool to alow LM studio have memory and edit files that has git initialized on them.
+This is an experimental collection of tools to alow LM studio have memory, edit files that has git initialized on them and more.
 All of the code was VibeCoded.
 
 Main files to use are:
