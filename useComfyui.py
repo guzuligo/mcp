@@ -324,7 +324,7 @@ def _send_and_wait(workflow: Dict[str, Any], timeout: int = 300) -> str:
             resp = client.post("/prompt", json=workflow)
             resp.raise_for_status()
             data = resp.json()
-            prompt_id = data.get("prompt_id") or (data.get("extra, {}).get("queue_prompt", [{}])[-1].get("inputs", {}).get("_data", {}).get("prompt_id", ""))
+            prompt_id = data.get("prompt_id") or (data.get("extra", {}).get("queue_prompt", [{}])[-1].get("inputs", {}).get("_data", {}).get("prompt_id", ""))
 
             if not prompt_id:
                 return f"Could not get prompt ID from server response: {json.dumps(data, indent=2)}"
@@ -344,7 +344,7 @@ def _send_and_wait(workflow: Dict[str, Any], timeout: int = 300) -> str:
                         if "images" in node_data:
                             for img in node_data["images"]:
                                 filename = img.get("filename", "")
-                                subfolder = img.get("subfolder", "")"
+                                subfolder = img.get("subfolder", "")
                     return f"Prompt submitted. Prompt ID: {prompt_id}. Image saved as '{filename}' (subfolder: {subfolder}). Check ComfyUI output folder for results."
 
             return "Timed out waiting for ComfyUI to finish the workflow."
