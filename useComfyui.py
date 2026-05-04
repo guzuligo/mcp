@@ -324,7 +324,7 @@ def _send_and_wait(workflow: Dict[str, Any], timeout: int = 300) -> str:
             resp = client.post("/prompt", json=workflow)
             resp.raise_for_status()
             data = resp.json()
-            prompt_id = data.get("prompt_id") or data.get("prompt_id") or (data.get("extra", {}).get("info", {}).get("queue_prompt", [{}])[-1].get("inputs", {}).get("_data", {}).get("prompt_id", ""))
+            prompt_id = data.get("prompt_id") or (data.get("extra, {}).get("queue_prompt", [{}])[-1].get("inputs", {}).get("_data", {}).get("prompt_id", ""))
 
             if not prompt_id:
                 return f"Could not get prompt ID from server response: {json.dumps(data, indent=2)}"
