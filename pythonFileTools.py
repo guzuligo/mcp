@@ -1054,66 +1054,385 @@ def create_file(
     }
 
 
+import threading
+import uuid
+
+# Shared registry to track running processes across tool calls
+_process_registry = {}
+
+# Keep last 10 completed/terminated processes for history tracking
+_process_history = []
+_MAX_HISTORY = 10
+
+
+def _add_to_history(entry):
+    """Add a process entry to the history, keeping only the most recent _MAX_HISTORY entries."""
+    global _process_history
+    _process_history.insert(0, entry)
+    if len(_process_history) > _MAX_HISTORY:
+        _process_history = _process_history[:_MAX_HISTORY]
+
+
+def _get_all_output_from_registry(process_id):
+    """Get all accumulated output from the registry (memory + file)."""
+    if process_id not in _process_registry:
+        return "", ""
+
+    entry = _process_registry[process_id]
+    # Get chunks stored directly in memory
+    stdout_chunks = entry.get("stdout_chunks", [])
+    stderr_chunks = entry.get("stderr_chunks", [])
+    stdout_from_mem = ''.join(stdout_chunks) if stdout_chunks else ''
+    stderr_from_mem = ''.join(stderr_chunks) if stderr_chunks else ''
+
+    # Also read from file for redundancy
+    try:
+        with open(entry["output_file"], 'r', encoding='utf-8') as f:
+            content = f.read()
+        # Parse [STDOUT]/[STDERR] prefixed lines
+        file_stdout, file_stderr = '', ''
+        for line in content.splitlines():
+            if line.startswith("[STDOUT]"):
+                file_stdout += line[8:]
+            elif line.startswith("[STDERR]"):
+                file_stderr += line[9:]
+    except FileNotFoundError:
+        file_stdout, file_stderr = '', ''
+
+    # Return memory data (primary) with file as fallback
+    return stdout_from_mem if stdout_from_mem else file_stdout, stderr_from_mem if stderr_from_mem else file_stderr
+
+
 @mcp.tool()
-def execute_command(command: str, working_dir: str = ".", timeout: int = 300) -> dict:
-    """Execute a bash command and return the result.
-       Note, use this only as a last resort if no other function could achieve what you need.
+def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4) -> dict:
+    """Execute a bash command and return the result with progressive output for LM Studio visibility.
+
+    The process is tracked in a shared registry so that get_command_output can retrieve partial results
+    as they arrive. This allows LM Studio to see output incrementally during long-running commands.
+    Output is stored immediately in memory (not just files) so it survives temp file cleanup.
 
     Args:
         command: The bash command to execute.
         working_dir: The working directory to execute the command in. Default: current directory
-        timeout: Maximum execution time in seconds. Default: 300
+        timeout: Maximum execution time in seconds for the process itself. Default: 300
+        wait_time: Recommended wait time in seconds between polling calls. Default: 4
 
     Returns:
-        A dictionary with stdout, stderr, return code, and execution time
+        A dictionary with stdout, stderr, return code, and execution time.
+        Includes output_file path for get_command_output to read progressive results.
     """
     start_time = time.time()
+    process_id = str(uuid.uuid4())
+    output_file = f"/tmp/mcp_cmd_output_{process_id}.txt"
+
+    # Enforce: effective timeout must be >= wait_time
+    effective_timeout = max(timeout, wait_time)
+
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             cwd=working_dir,
             stdin=subprocess.DEVNULL,
+            universal_newlines=True,
         )
 
+        # Store in registry with immediate memory storage for output
+        _process_registry[process_id] = {
+            "process": process,
+            "output_file": output_file,
+            "command": command,
+            "start_time": start_time,
+            "effective_timeout": effective_timeout,
+            "stdout_chunks": [],  # Immediate memory storage for stdout
+            "stderr_chunks": [],  # Immediate memory storage for stderr
+        }
+
+        # Use threading to read stdout and stderr concurrently without blocking
+        def read_stdout():
+            """Read from stdout pipe until EOF."""
+            try:
+                while True:
+                    line = process.stdout.readline()
+                    if line == '':
+                        break
+                    _process_registry[process_id]["stdout_chunks"].append(line)
+            except Exception:
+                pass
+
+        def read_stderr():
+            """Read from stderr pipe until EOF."""
+            try:
+                while True:
+                    line = process.stderr.readline()
+                    if line == '':
+                        break
+                    _process_registry[process_id]["stderr_chunks"].append(line)
+            except Exception:
+                pass
+
+        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Return immediately - process continues running in background threads
+        # The caller can poll get_command_output for updates as more output arrives
         end_time = time.time()
         execution_time = end_time - start_time
+
+        proc_status = process.poll()
 
         return {
             "command": command,
             "working_dir": os.path.abspath(working_dir),
-            "return_code": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.returncode == 0,
+            "process_id": process_id,
+            "output_file": output_file,
+            "return_code": proc_status if proc_status is not None else None,
+            "stdout": '',  # Will be populated by threads
+            "stderr": '',
+            "success": (proc_status == 0) if proc_status is not None else None,
+            "is_complete": proc_status is not None,
             "execution_time_seconds": round(execution_time, 3),
+            "recommended_wait_time": wait_time,
+            "effective_timeout": effective_timeout,
         }
+
     except subprocess.TimeoutExpired:
         end_time = time.time()
         execution_time = end_time - start_time
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
         return {
             "command": command,
             "working_dir": os.path.abspath(working_dir),
+            "process_id": process_id,
+            "output_file": output_file,
             "return_code": -1,
             "stdout": "",
-            "stderr": f"Command timed out after {timeout} seconds",
+            "stderr": f"Command timed out after {effective_timeout} seconds",
             "success": False,
+            "is_complete": True,
             "execution_time_seconds": round(execution_time, 3),
         }
+
     except Exception as e:
         end_time = time.time()
         execution_time = end_time - start_time
         return {
             "command": command,
             "working_dir": os.path.abspath(working_dir),
+            "process_id": process_id,
+            "output_file": output_file,
             "return_code": -1,
             "stdout": "",
             "stderr": f"Error executing command: {e}",
             "success": False,
+            "is_complete": True,
             "execution_time_seconds": round(execution_time, 3),
+        }
+
+
+@mcp.tool()
+def get_command_output(output_file: str = None, process_id: str = None, wait_time: int = 4) -> dict:
+    """Get the current output from a previously started command.
+
+    Reads accumulated output from memory (primary) and file (fallback).
+    Useful for polling during long-running commands after calling execute_command.
+
+    Args:
+        process_id: The UUID from execute_command. Required.
+        wait_time: Recommended wait time in seconds between polling calls. Default: 4
+
+    Returns:
+        A dictionary with accumulated stdout, stderr, and metadata about the last read time.
+    """
+    if not process_id:
+        return {
+            "stdout": "",
+            "stderr": "",
+            "success": False,
+            "is_complete": False,
+            "message": "'process_id' must be provided.",
+        }
+
+    # Get all output from registry (memory + file)
+    stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
+
+    return {
+        "process_id": process_id,
+        "stdout": stdout_from_mem if stdout_from_mem else '',
+        "stderr": stderr_from_mem if stderr_from_mem else '',
+        "success": True,
+        "is_complete": False,
+        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "recommended_wait_time": wait_time,
+    }
+
+
+@mcp.tool()
+def check_progress(process_id: str) -> dict:
+    """Check the progress of a running or completed command.
+
+    Returns the current state of the process including whether it's still running,
+    how much output has been captured so far, and any return code if complete.
+    Useful for monitoring long-running commands without reading the output file directly.
+
+    Args:
+        process_id: The UUID returned from execute_command.
+
+    Returns:
+        A dictionary with status, is_running, return_code, stdout, stderr, and metadata.
+    """
+    if process_id not in _process_registry:
+        # Check history for completed processes
+        for entry in _process_history:
+            if entry["process_id"] == process_id:
+                return {
+                    "process_id": process_id,
+                    "command": entry["command"],
+                    "is_running": False,
+                    "return_code": entry.get("return_code"),
+                    "stdout": entry.get("stdout", ""),
+                    "stderr": entry.get("stderr", ""),
+                    "output_file": entry.get("output_file"),
+                    "current_output_length": len(entry.get("stdout", "")) + len(entry.get("stderr", "")),
+                    "status": "completed" if entry.get("return_code") == 0 else ("failed" if entry.get("return_code is not None") else "unknown"),
+                }
+        return {
+            "status": "error",
+            "message": f"No process found for ID '{process_id}'. It may have already completed or been cleaned up.",
+        }
+
+    entry = _process_registry[process_id]
+    process = entry["process"]
+
+    # Check if process is still running
+    poll_result = process.poll()
+    is_running = (poll_result is None)
+
+    # Get all output from memory + file
+    stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
+
+    return {
+        "process_id": process_id,
+        "command": entry["command"],
+        "is_running": is_running,
+        "return_code": poll_result if not is_running else None,
+        "output_file": entry["output_file"],
+        "current_output_length": len(stdout_from_mem) + len(stderr_from_mem),
+        "status": "running" if is_running else ("completed" if poll_result == 0 else "failed"),
+    }
+
+
+@mcp.tool()
+def get_command_history(limit: int = 10) -> dict:
+    """Get the history of recently completed/terminated processes.
+
+    Keeps track of the last N (default 10) processes that have finished or been killed,
+    including their final state and output. Useful for reviewing what happened to previous commands.
+
+    Args:
+        limit: Maximum number of entries to return. Default: 10
+
+    Returns:
+        A dictionary with total_count, history (list of process entries), and each entry includes
+        process_id, command, return_code, stdout, stderr, start_time, end_time, execution_time_seconds.
+    """
+    # Filter only completed/terminated processes from memory
+    completed_history = []
+    for pid, entry in _process_registry.items():
+        if entry["process"].poll() is not None:
+            completed_history.append({
+                "process_id": pid,
+                "command": entry["command"],
+                "status": "completed" if entry.get("return_code") == 0 else ("failed" if entry.get("return_code") is not None else "unknown"),
+                "start_time": entry.get("start_time"),
+            })
+
+    # Merge with stored history, deduplicate by process_id
+    all_entries = {}
+    for h in _process_history:
+        all_entries[h["process_id"]] = h
+    for c in completed_history:
+        if c["process_id"] not in all_entries:
+            all_entries[c["process_id"]] = c
+
+    # Sort by start_time (most recent first) and limit
+    sorted_entries = sorted(
+        all_entries.values(),
+        key=lambda x: x.get("start_time") or 0,
+        reverse=True,
+    )[:limit]
+
+    return {
+        "total_count": len(sorted_entries),
+        "history": sorted_entries,
+    }
+
+
+@mcp.tool()
+def kill_process(process_id: str) -> dict:
+    """Kill a running process by its ID.
+
+    Sends SIGKILL to the subprocess tracked under the given process_id.
+    Useful for stopping long-running commands early.
+
+    Args:
+        process_id: The UUID returned from execute_command.
+
+    Returns:
+        A dictionary with status, killed_process_id, and message.
+    """
+    if process_id not in _process_registry:
+        return {
+            "status": "error",
+            "message": f"No running process found for ID '{process_id}'. It may have already completed or been cleaned up.",
+        }
+
+    entry = _process_registry[process_id]
+    process = entry["process"]
+
+    try:
+        # Try graceful shutdown first, then force kill if needed
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+            status_msg = "terminated"
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            status_msg = "killed with SIGKILL"
+
+        # Add to history before removing from registry
+        _add_to_history({
+            "process_id": process_id,
+            "command": entry["command"],
+            "return_code": process.returncode if hasattr(process, 'returncode') else None,
+            "start_time": entry.get("start_time"),
+            "end_time": time.time(),
+            "stdout": ''.join(entry.get("stdout_chunks", [])),
+            "stderr": ''.join(entry.get("stderr_chunks", [])),
+        })
+
+        # Clean up registry entry
+        del _process_registry[process_id]
+
+        return {
+            "status": "success",
+            "killed_process_id": process_id,
+            "message": f"Process '{entry['command']}' was {status_msg}.",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "killed_process_id": process_id,
+            "message": f"Error killing process: {e}",
         }
 
 
