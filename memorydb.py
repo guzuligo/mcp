@@ -33,10 +33,14 @@ All memories are stored in a single JSON file (the "database") with indexes for 
 
 import json
 import uuid
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set
 from fastmcp import FastMCP
+
+# Thread lock for thread-safe database operations
+_db_lock = threading.Lock()
 
 mcp = FastMCP("memorydb")
 
@@ -76,13 +80,51 @@ class MemoryDB:
                 }
             }
         with open(db_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            content = f.read()
+        
+        # Validate and fix JSON - handle common corruption issues
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            # Try to fix common corruption: trailing commas, single quotes, etc.
+            import re
+            fixed = content
+            # Replace trailing commas before closing braces/brackets
+            fixed = re.sub(r',(\s*[}\]])', r'\1', fixed)
+            # Replace single quotes with double quotes for string values
+            fixed = re.sub(r"'([^']*)'", r'"\1"', fixed)
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError as e2:
+                raise json.JSONDecodeError(
+                    f"Database file is corrupted and could not be auto-fixed. "
+                    f"Original error: {e}; Fix attempt error: {e2}",
+                    e.doc, e.pos
+                )
 
     def _save_db(self, data: dict) -> None:
-        """Save the database to file."""
+        """Save the database to file (atomic write via temp file)."""
         db_path = self._get_db_path()
-        with open(db_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
+        # Write to temp file first, then rename for atomicity
+        import tempfile
+        import os
+        db_dir = str(Path(db_path).parent)
+        fd, tmp_path = tempfile.mkstemp(dir=db_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+            # Atomic rename
+            if os.path.exists(tmp_path):
+                os.replace(tmp_path, db_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    def _save_db_locked(self, data: dict) -> None:
+        """Save the database with thread lock for safety."""
+        with _db_lock:
+            self._save_db(data)
 
     def _generate_id(self) -> str:
         """Generate a unique ID for a new memory."""
@@ -152,7 +194,11 @@ class MemoryDB:
         related_ids: List[str] = None,
         important_keywords: List[str] = None
     ) -> dict:
-        """Save a new memory item to the database."""
+        """Save a new memory item to the database.
+
+        All fields are required except related_ids and important_keywords which default to empty lists.
+        The summary should contain specific details (dates, numbers, links, names) that won't be obvious from reading just the title.
+        """
         valid_types = self.__valid_types()
         if not types or any(t not in valid_types for t in types):
             raise ValueError(f"Invalid type(s). Must be one or more of: {valid_types}")
@@ -271,13 +317,24 @@ class MemoryDB:
         return False
 
     def update_memory(self, memory_id: str, updates: dict) -> bool:
-        """Update an existing memory."""
+        """Update an existing memory.
+
+        Args:
+            memory_id: The unique identifier of the memory to update (must be a valid UUID4 string)
+            updates: Dictionary of fields to update. Valid keys are:
+                     "keyword", "title", "summary", "memory_types", "related_ids", "important_keywords_related"
+        Returns:
+            True if updated successfully, False if not found
+        """
         db = self._load_db()
         for m in db["memories"]:
             if m["id"] == memory_id:
+                # Validate update keys
+                valid_keys = ("keyword", "title", "summary", "memory_types", "related_ids", "important_keywords_related")
                 for key, value in updates.items():
-                    if key in ("keyword", "title", "summary", "memory_types", "related_ids", "important_keywords_related"):
-                        m[key] = value
+                    if key not in valid_keys:
+                        raise ValueError(f"Invalid field '{key}'. Valid fields are: {valid_keys}")
+                    m[key] = value
 
                 # Update indexes
                 self._remove_from_indexes(db, memory_id)
@@ -537,17 +594,47 @@ def update_memory(
     """Update an existing memory.
 
     Args:
-        memory_id: The unique identifier of the memory to update
-        updates: JSON string with fields to update (e.g., '{"title": "New Title"}')
+        memory_id: The unique identifier (UUID4 string) of the memory to update.
+                   Use get_all_memories or search to find valid IDs.
+        updates: JSON string with fields to update. Example: '{"summary": "Updated summary text"}'
+                 Valid keys are: keyword, title, summary, memory_types, related_ids, important_keywords_related
 
     Returns:
-        JSON string with update result
+        JSON string with update result including status, message, and applied updates
+
+    Usage example:
+        To update a memory's summary:
+          update_memory("uuid4-string-here", '{"summary": "New summary text"}')
+
+        To update multiple fields at once:
+          update_memory("uuid4-string-here", '{"title": "New Title", "summary": "Updated content"}')
     """
     try:
         mem = MemoryDB()
-        update_dict = json.loads(updates) if isinstance(updates, str) else updates
+        
+        # Validate memory_id is not empty
+        if not memory_id or not memory_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "memory_id is required. Use get_all_memories to find valid IDs."
+            }, indent=2)
+
+        # Parse updates JSON string
+        try:
+            update_dict = json.loads(updates) if isinstance(updates, str) else updates
+        except (json.JSONDecodeError, TypeError):
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid JSON in 'updates' parameter. Got: '{updates}'"
+            }, indent=2)
 
         success = mem.update_memory(memory_id, update_dict or {})
+
+        if not success:
+            return json.dumps({
+                "status": "not_found",
+                "message": f"No memory found with ID '{memory_id}'. Use get_all_memories to list all memories."
+            }, indent=2)
 
         return json.dumps({
             "status": "success" if success else "not_found",

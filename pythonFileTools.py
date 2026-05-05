@@ -175,7 +175,9 @@ def search_file_content(
 
 def _validate_path(path: Path) -> Path:
     """Validate that a path is within the home directory for security."""
-    resolved = path.resolve()
+    # Expand ~ (tilde) to user's home directory before resolving
+    expanded = os.path.expanduser(str(path))
+    resolved = Path(expanded).resolve()
     if not str(resolved).startswith(str(HOME_DIR)):
         raise ValueError(f"Access denied: paths outside home directory are not allowed. Requested: {resolved}")
     return resolved
@@ -862,7 +864,8 @@ def create_file(
 ) -> dict:
     """Create a new file with the given content and commit to git for undo capability.
 
-    Checks if git repository exists before creating the file. If the file already exists
+    Note that this tool can't be used in folders where no git is initialized.
+    It checks if git repository exists before creating the file. If the file already exists
     and overwrite is False, returns an error. The file is written to disk and committed to git
     so it can be undone later.
 
