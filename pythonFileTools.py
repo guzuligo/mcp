@@ -88,6 +88,18 @@ def search_file_content(
 ) -> dict:
     """Search for a regex pattern in file contents.
 
+    The search uses regular expressions, which makes it very powerful and flexible. Here are some tips for effective searching:
+
+    TIP 1 - Use multiple keywords with alternation (|): When you're looking for files that might contain any of several related terms, use the pipe character `|` to separate them. For example:
+        pattern="directory|path|folder"
+    This will match ANY line containing AT LEAST ONE of those words. This is especially useful when you're unsure which term the code uses - you'll catch all variations in one search instead of running multiple queries.
+
+    TIP 2 - Case-insensitive by default: The search is case-INSENSITIVE, so "Path", "PATH", and "path" will all match with a single pattern like `(?i)pat`. This means you don't need to worry about capitalization when searching.
+
+    TIP 3 - Combine OR and AND logic: Use `|` for OR (at least one matches) and simple concatenation for AND (all terms must appear). For example:
+        pattern="import|from" finds lines with either word (OR)
+        pattern="importos" finds lines containing both words together (AND)
+
     Args:
         pattern: The regular expression pattern to search for
         path: The directory to search in. Default: current directory
