@@ -93,6 +93,8 @@ async def _extract_sections_from_page(page, url: str) -> list:
             return false;
         }
 
+        function hashCode(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); } return h; }
+
         function isInteractiveElement(el) {
             const interactiveTags = ['button', 'a', 'input', 'select', 'details', 'summary'];
             if (interactiveTags.includes(el.tagName.toLowerCase())) return true;
@@ -241,7 +243,7 @@ async def open_page(url: str, headless: bool = True) -> str:
             await asyncio.sleep(1)
 
             title = await page.title()
-            current_url = await page.url()
+            current_url = page.url
 
             sections = await _extract_sections_from_page(page, url)
             for s in sections:
@@ -292,7 +294,7 @@ async def navigate_to(url: str) -> str:
             await page.goto(url, wait_until="networkidle", timeout=30000)
             await asyncio.sleep(1)
             title = await page.title()
-            current_url = await page.url()
+            current_url = page.url
 
             return json.dumps({
                 "tool": "navigate_to",
@@ -336,7 +338,7 @@ async def click_element(selector: str) -> str:
             # For click_element, we just perform the click and return what happened
             await page.click(selector)
             await asyncio.sleep(1)
-            current_url = await page.url() if hasattr(page, 'url') else "still on same page"
+            current_url = page.url if hasattr(page, 'url') else "still on same page"
             title = await page.title() if hasattr(page, 'title') else ""
 
             return json.dumps({
@@ -385,7 +387,7 @@ async def fill_form(selector: str, value: str) -> str:
 
         try:
             await page.fill(selector, value)
-            current_url = await page.url() if hasattr(page, 'url') else ""
+            current_url = page.url if hasattr(page, 'url') else ""
             title = await page.title() if hasattr(page, 'title') else ""
 
             return json.dumps({
@@ -432,7 +434,7 @@ async def get_page_state() -> str:
         page = await browser.new_page()
 
         try:
-            current_url = await page.url()
+            current_url = page.url
             title = await page.title()
             sections = await _extract_sections_from_page(page, current_url)
             for s in sections:
@@ -487,7 +489,7 @@ async def go_back() -> str:
         try:
             await page.go_back()
             await asyncio.sleep(1)
-            current_url = await page.url() if hasattr(page, 'url') else ""
+            current_url = page.url if hasattr(page, 'url') else ""
             title = await page.title() if hasattr(page, 'title') else ""
 
             return json.dumps({
@@ -531,7 +533,7 @@ async def go_forward() -> str:
         try:
             await page.go_forward()
             await asyncio.sleep(1)
-            current_url = await page.url() if hasattr(page, 'url') else ""
+            current_url = page.url if hasattr(page, 'url') else ""
             title = await page.title() if hasattr(page, 'title') else ""
 
             return json.dumps({
@@ -580,7 +582,7 @@ async def take_screenshot(path: str = None) -> str:
             screenshot = await page.screenshot(full_page=False)
             b64 = base64.b64encode(screenshot).decode('ascii')
 
-            current_url = await page.url() if hasattr(page, 'url') else ""
+            current_url = page.url if hasattr(page, 'url') else ""
             title = await page.title() if hasattr(page, 'title') else ""
 
             return json.dumps({
