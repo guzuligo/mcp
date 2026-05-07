@@ -1,7 +1,7 @@
 This is an experimental collection of tools to alow LM studio have memory, edit files that has git initialized on them and more.
 All of the code (even the README) was VibeCoded using Qwen3.6
 
-# Sword AI Memory & File Tools
+# MemoryDB & File Tools
 
 Give your AI assistant a **memory** so it remembers what you've discussed, and the ability to **edit files** directly — all through a simple MCP connection.
 
@@ -11,7 +11,7 @@ All of the code was VibeCoded using Qwen3.6.
 
 ## 🧠 memorylite - AI Memory System
 
-Let your AI remember conversations, facts, and preferences across sessions using SQLite. No more starting each chat from scratch.
+Don't you hate it when you have to explain everything from scrach. Let your AI remember conversations, facts, and preferences across sessions using SQLite.
 
 ### What it does
 - Remembers everything you've discussed in a structured way
@@ -40,6 +40,23 @@ Let your AI remember conversations, facts, and preferences across sessions using
 3. That's it — your AI will now remember things between sessions.
 
 **Where memories are stored:** `~/.swordmemory/memory.db` (SQLite database)
+
+### Advanced: Custom Database Location
+
+By default, the SQLite database is created at `~/.swordmemory/memory.db`. To use a custom location, add the `--path` argument to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "memorylite": {
+      "command": "python",
+      "args": ["/full/path/to/memorylite.py", "--path", "/custom/path/to/your/database"]
+    }
+  }
+}
+```
+
+**Note:** If the path ends with `/` or `\`, it's treated as a directory and `memory.db` will be created inside that folder. Otherwise, the path is used as the full file path directly.
 
 ---
 
