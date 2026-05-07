@@ -49,8 +49,10 @@ DATABASE SCHEMA:
     parameter to conditionally include the summary field (default: False) to reduce I/O cost.
 """
 
+import argparse
 import json
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -191,9 +193,20 @@ class MemoryLite:
     VALID_TYPES = ["personal", "document", "reference", "chat", "chitchat", "technical"]
 
     def _get_db_path(self) -> Path:
-        """Get the path to the database file."""
+        """Get the path to the database file.
+
+        Handles two cases for DB_FILE:
+          - If it ends with '/' or '\\' → treat as directory, append 'memory.db'
+          - Otherwise → use as full file path
+        """
         if self.DB_FILE is not None:
-            return Path(self.DB_FILE)
+            p = Path(self.DB_FILE)
+            # Check if it's a directory (ends with / or \\)
+            stripped = str(self.DB_FILE).rstrip()
+            if stripped.endswith('/') or stripped.endswith('\\'):
+                return Path(stripped.rstrip('/').rstrip('\\\\')) / "memory.db"
+            else:
+                return p
         else:
             home_docs = Path.home()
             db_dir = home_docs.joinpath(".swordmemory")
@@ -207,6 +220,52 @@ class MemoryLite:
         conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _check_db_exists(self) -> bool:
+        """Check if the database file exists.
+        
+        Returns True if the DB file exists or can be created, False otherwise.
+        Also returns True after _init_db() is called since it creates the schema.
+        """
+        db_path = self._get_db_path()
+        return Path(db_path).exists()
+
+    def ensure_db_initialized(self) -> None:
+        """Ensure the database file exists and is initialized.
+        
+        Creates the DB file if it doesn't exist, then initializes the schema.
+        Raises FileNotFoundError if the parent directory doesn't exist or can't be created.
+        """
+        db_path = self._get_db_path()
+        db_file = Path(db_path)
+        
+        # If path ends with / or \, it's a directory - ensure dir exists
+        stripped = str(db_path).rstrip('/\\')
+        if stripped.endswith('/') or stripped.endswith('\\'):
+            dir_path = Path(stripped)
+            dir_path.mkdir(parents=True, exist_ok=True)
+        else:
+            # It's a file path - ensure parent directory exists
+            parent_dir = db_file.parent
+            if not parent_dir.exists():
+                parent_dir.mkdir(parents=True, exist_ok=True)
+        
+        self._init_db()
+
+    def _get_connection_safe(self) -> sqlite3.Connection:
+        """Get a SQLite connection with proper settings and error handling.
+        
+        Returns (conn, None) on success or (None, error_message) if the DB file doesn't exist yet.
+        """
+        try:
+            return self._get_connection(), None
+        except sqlite3.OperationalError as e:
+            if "unable to open database file" in str(e):
+                db_path = self._get_db_path()
+                if not Path(db_path).exists():
+                    return None, f"Database not yet initiated. Save a memory first."
+                raise
+            raise
 
     def _init_db(self) -> None:
         """Initialize the database schema if not exists."""
@@ -730,6 +789,20 @@ from typing import Union
 
 from typing import Optional as Opt
 
+def _handle_db_error(func):
+    """Decorator that catches 'unable to open database file' errors and returns a descriptive message."""
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            if "unable to open database file" in str(e):
+                return json.dumps({
+                    "status": "error",
+                    "message": "Database not yet initiated. Save a memory first."
+                }, indent=2)
+            raise
+    return wrapper
+
 @mcp.tool
 def save_memory(
     keyword: str = "",
@@ -753,7 +826,7 @@ def save_memory(
       - Phrases that capture the essence of what this memory is about
     
     WHAT NOT TO INCLUDE:
-      - Words already covered by 'title' or 'summary' (avoid simple duplication)
+      - Words already covered by 'title' or 'summary (avoid simple duplication)
       - Generic stop words (the, a, an, for, etc.)
       - Anything too broad to be useful as a search term
     
@@ -775,7 +848,7 @@ def save_memory(
     """
     try:
         mem = MemoryLite()
-        mem._init_db()  # Ensure schema exists
+        mem.ensure_db_initialized()  # Ensure DB exists and is initialized
 
         # Handle both string and already-parsed list inputs from LLMs
         types_list = types if isinstance(types, list) else (_parse_json_list_or_fix(types) if isinstance(types, str) else None)
@@ -837,6 +910,13 @@ def get_memory_by_id(memory_id: str = "") -> str:
             "message": f"Memory retrieved successfully",
             "data": result
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -862,6 +942,13 @@ def get_memories_by_ids(memory_ids_str: str = "") -> str:
             "total_found": len(results),
             "memories": results
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -892,6 +979,13 @@ def get_memory_by_keyword(keyword: str = "") -> str:
             "message": f"Memory retrieved successfully",
             "data": result
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -915,14 +1009,14 @@ def search(
       wordJoin controls how these conditions are combined:
         - "OR" (default): Each word is searched independently; ANY word matching returns the record
           Example: search(pattern="meeting about budget", wordJoin="OR") 
-                   → finds memories containing "meeting" OR "about" OR "budget"
+                   → finds memories containing "meeting OR about OR budget
         
         - "AND": EACH word must appear in the result; ALL words must match
           Example: search(pattern="meeting about budget", wordJoin="AND")
-                   → only returns memories containing "meeting" AND "about" AND "budget"
+                   → only returns memories containing "meeting AND about AND budget
 
     USE CASES:
-      - Use OR (default) for broad discovery: find anything related to any of these terms
+      - Use OR (default for broad discovery: find anything related to any of these terms
       - Use AND for precise filtering: require all terms appear in each result
       
     EXAMPLE WORKFLOW for deep memory exploration:
@@ -935,7 +1029,7 @@ def search(
         pattern: Text to search for (each space-separated token becomes a separate LIKE condition)
         types: JSON array string of type tags to filter by (e.g., '["personal"]')
         keyword: Exact keyword/ID to search for
-        wordJoin: How to combine multi-word patterns - "OR" (any word matches, default) or "AND" (all words must match)
+        wordJoin: How to combine multi-word patterns - "OR" (any word matches, default or "AND" (all words must match)
 
     Returns:
         JSON string containing list of matched memory data. Each call returns ALL matching results - 
@@ -959,6 +1053,13 @@ def search(
             "total_matches": len(results),
             "results": results
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -980,6 +1081,13 @@ def get_all_memories() -> str:
             "memories": results,
             "note": "Use include_summary=true with get_memory_by_id to retrieve full summaries"
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -1000,6 +1108,13 @@ def get_all_types() -> str:
             "types": types_list,
             "description": "Each entry shows a type tag and how many memories use it"
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -1023,6 +1138,13 @@ def get_all_keywords(pattern: str = "") -> str:
             "total_keywords": len(results),
             "keywords": results
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -1068,6 +1190,13 @@ def get_all_words(pattern: str = "") -> str:
             "words_by_field": results,
             "note": "Each field shows words extracted from that specific field's text"
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -1087,6 +1216,13 @@ def get_memory_stats() -> str:
             "status": "success",
             "statistics": stats
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -1109,6 +1245,13 @@ def delete_memory(memory_id: str = "") -> str:
             "status": "success" if success else "not_found",
             "message": f"Memory {'deleted successfully' if success else 'not found'} with ID '{memory_id}'"
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -1121,7 +1264,7 @@ def update_memory(
     """Update an existing memory.
 
     Args:
-        memory_id: The unique identifier (UUID4 string) of the memory to update
+        memory_id: The unique identifier (UUID4 string of the memory to update
         updates: JSON string with fields to update. Example: '{"summary": "Updated summary text"}'
                  Valid keys are: keyword, title, summary, memory_types, related_ids, keywords
 
@@ -1164,8 +1307,52 @@ def update_memory(
             "message": f"Memory {'updated successfully' if success else 'not found'} with ID '{memory_id}'",
             "updates_applied": list(update_dict.keys()) if update_dict else []
         }, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
+
+
+# ============================================================================
+# CLI Argument Parsing and Main Entry Point
+# ============================================================================
+
+
+def _parse_args():
+    """Parse command-line arguments for database path configuration."""
+    parser = argparse.ArgumentParser(
+        description="memorylite - Lightweight LLM Memory Database System (SQLite Backend)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python memorylite.py --path /home/user/memory/     # Use directory as base for memory.db
+  python memorylite.py --path /home/user/mydb.db      # Use full file path directly
+  python memorylite.py                                # Use default ~/.swordmemory/memory.db
+
+When the path ends with a slash (e.g., /some/dir/), it is treated as a directory
+and 'memory.db' will be appended to form the database file path.
+        """
+    )
+    parser.add_argument(
+        "--path",
+        type=str,
+        default=None,
+        help="Database path: if ends with '/' treats as directory (appends memory.db), "
+             "otherwise uses as full file path"
+    )
+    return parser.parse_args()
+
+
+def _setup_db_from_cli():
+    """Set up the database path from CLI arguments."""
+    args = _parse_args()
+    if args.path:
+        MemoryLite.DB_FILE = args.path
 
 
 # ============================================================================
@@ -1173,6 +1360,9 @@ def update_memory(
 # ============================================================================
 
 if __name__ == "__main__":
+    # Set up DB path from CLI arguments before any other operations
+    _setup_db_from_cli()
+
     print("memorylite - LLM Memory Database System (SQLite Backend)")
     print("=" * 50)
     print("This module provides memory management via FastMCP tools.")
