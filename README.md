@@ -1,5 +1,5 @@
 This is an experimental collection of tools to alow LM studio have memory, edit files that has git initialized on them and more.
-All of the code (even the README) was VibeCoded using Qwen3.6
+All of the code (including the README) was VibeCoded using Qwen3.6
 
 # MemoryDB & File Tools
 
