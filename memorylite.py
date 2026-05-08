@@ -563,7 +563,7 @@ class MemoryLite:
             type_counts = {}
             for t in self.VALID_TYPES:
                 count = db.execute(
-                    "SELECT COUNT(DISTINCT id) FROM memories, json_each(memory_types) WHERE json_each.value = ?",
+                    "SELECT COUNT(DISTINCT memories.id) FROM memories, json_each(memory_types) WHERE json_each.value = ?",
                     (t,)
                 ).fetchone()[0]
                 type_counts[t] = {"count": count}
@@ -584,7 +584,7 @@ class MemoryLite:
         db = self._get_connection()
         try:
             rows = db.execute(
-                """SELECT json_each.value as type_name, COUNT(DISTINCT id) as count 
+                """SELECT json_each.value as type_name, COUNT(DISTINCT memories.id) as count 
                    FROM memories, json_each(memory_types) 
                    GROUP BY type_name"""
             ).fetchall()
@@ -620,7 +620,7 @@ class MemoryLite:
     def get_all_words(self, pattern: str = None) -> dict:
         """Extract all words from every text field in the database.
 
-        This method scans all text fields (title, summary, keyword, memory_types, related_ids, related_items, important_keywords_related)
+        This method scans all text fields (title, summary, keyword, memory_types, related_ids, related_items, keywords)
         and returns a breakdown of which words appear in which fields.
 
         Args:
@@ -646,7 +646,7 @@ class MemoryLite:
         try:
             # Get all memories with title and summary (include_summary=True)
             rows = db.execute(
-                "SELECT id, keyword, title, summary, memory_types, related_ids, related_items, important_keywords_related FROM memories"
+                "SELECT id, keyword, title, summary, memory_types, related_ids, related_items, keywords FROM memories"
             ).fetchall()
 
             result = {
@@ -660,8 +660,8 @@ class MemoryLite:
             }
 
             for row in rows:
-                # row[0]=id, row[1]=keyword, row[2]=title, row[3=summary, 
-                # row[4]=memory_types (JSON string), row[5]=related_ids, row[6]=related_items, row[7]=important_keywords_related
+                # row[0]=id, row[1]=keyword, row[2]=title, row[3]=summary, 
+                # row[4]=memory_types (JSON string), row[5]=related_ids, row[6]=related_items, row[7]=keywords
                 
                 # Extract words from each field
                 if row[2]:  # title
@@ -768,15 +768,21 @@ class MemoryLite:
         Args:
             row: SQLite row data (already fetched from database)
             include_summary: Whether to include the summary field in the returned dict
-                           (default: False for efficiency)
+                               (default: False for efficiency)
         """
         if not row:
             return None
         
-        # Map column names from the schema based on what was selected
-        # The columns match _select_columns() output, so we define them explicitly
-        all_columns = ["id", "keyword", "title", "summary", "memory_types", 
-                       "related_ids", "related_items", "keywords", "created_at", "updated_at"]
+        # Map column names from the schema based on what was selected.
+        # The column list must match _select_columns() output exactly.
+        # When include_summary=False, 'summary' is excluded so all subsequent
+        # indices shift up by one. Using the correct list prevents column misalignment.
+        if include_summary:
+            all_columns = ["id", "keyword", "title", "summary", "memory_types", 
+                           "related_ids", "related_items", "keywords", "created_at", "updated_at"]
+        else:
+            all_columns = ["id", "keyword", "title", "memory_types", 
+                           "related_ids", "related_items", "keywords", "created_at", "updated_at"]
         
         # Build dict from the existing row data (no additional DB call needed)
         row_data = {}
@@ -791,10 +797,6 @@ class MemoryLite:
                     row_data[field] = json.loads(row_data[field])
                 except (json.JSONDecodeError, TypeError):
                     row_data[field] = []
-
-        # Remove summary field if not requested and it's present in the data
-        if not include_summary and "summary" in row_data:
-            del row_data["summary"]
 
         return row_data
 
