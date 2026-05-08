@@ -486,16 +486,20 @@ class MemoryLite:
         finally:
             db.close()
 
-    def update_memory(self, memory_id: str, updates: dict) -> bool:
+    def update_memory(self, memory_id, updates: dict) -> bool:
         """Update an existing memory.
 
         Args:
-            memory_id: The unique identifier of the memory to update
+            memory_id: The unique identifier of the memory to update (will be converted to string if needed)
             updates: Dictionary of fields to update
 
         Returns:
             True if updated successfully, False if not found
         """
+        # Ensure memory_id is always a string for consistent SQLite matching
+        if not isinstance(memory_id, str):
+            memory_id = str(memory_id).strip() if memory_id else ""
+        
         valid_keys = ("keyword", "title", "summary", "memory_types", "related_ids", "related_items", "keywords")
         for key in updates.keys():
             if key not in valid_keys:
@@ -503,17 +507,31 @@ class MemoryLite:
 
         timestamp = self._get_timestamp()
         
-        # Convert lists to JSON strings where needed
+        # Convert lists/strings to JSON strings where needed
         json_fields = {"memory_types", "related_ids", "related_items", "keywords"}
         for key in updates:
-            if key in json_fields and isinstance(updates[key], list):
-                updates[key] = json.dumps(updates[key])
+            if key in json_fields:
+                if isinstance(updates[key], list):
+                    updates[key] = json.dumps(updates[key])
+                elif isinstance(updates[key], str):
+                    # Already a string - try to parse as JSON, keep as-is if not valid JSON
+                    try:
+                        parsed = json.loads(updates[key])
+                        # If it's already a list/dict after parsing, re-serialize it
+                        if isinstance(parsed, (list, dict)):
+                            updates[key] = json.dumps(parsed)
+                        # Otherwise keep the original string value
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # Keep as-is for non-list fields like title/summary
 
         set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
         
         db = self._get_connection()
         try:
-            values = list(updates.values()) + [memory_id, timestamp]
+            # Note: timestamp first, then memory_id to match the SQL placeholders
+            # The query is: SET {set_clause}, updated_at = ? WHERE id = ?
+            # So we need [all_update_values..., timestamp, memory_id]
+            values = list(updates.values()) + [timestamp, memory_id]
             rows_affected = db.execute(
                 f"UPDATE memories SET {set_clause}, updated_at = ? WHERE id = ?",
                 tuple(values)
@@ -1264,15 +1282,19 @@ def update_memory(
     """Update an existing memory.
 
     Args:
-        memory_id: The unique identifier (UUID4 string of the memory to update
-        updates: JSON string with fields to update. Example: '{"summary": "Updated summary text"}'
-                 Valid keys are: keyword, title, summary, memory_types, related_ids, keywords
+        memory_id: The unique identifier (UUID4 string) of the memory to update
+        updates: JSON string or dict with fields to update. Example: '{"summary": "Updated summary text"}'
+                 Valid keys are: keyword, title, summary, memory_types, related_ids, related_items, keywords
 
     Returns:
-        JSON string with update result including status, message, and applied updates
+        JSON string with update result including status, message, and applied updates (with actual values)
     """
     try:
         mem = MemoryLite()
+        
+        # Ensure memory_id is always a string (FastMCP may pass as int/str)
+        if not isinstance(memory_id, str):
+            memory_id = str(memory_id).strip() if memory_id else ""
         
         if not memory_id or not memory_id.strip():
             return json.dumps({
@@ -1294,7 +1316,23 @@ def update_memory(
         else:
             update_dict = {}
 
-        success = mem.update_memory(memory_id, update_dict or {})
+        # Convert string values in updates dict to proper JSON strings for json_fields
+        json_field_keys = {"memory_types", "related_ids", "related_items", "keywords"}
+        converted_updates = {}
+        for k, v in (update_dict or {}).items():
+            if k in json_field_keys and isinstance(v, str):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        converted_updates[k] = json.dumps(parsed)
+                    else:
+                        converted_updates[k] = v
+                except (json.JSONDecodeError, TypeError):
+                    converted_updates[k] = v
+            else:
+                converted_updates[k] = v
+
+        success = mem.update_memory(memory_id, converted_updates or {})
 
         if not success:
             return json.dumps({
@@ -1302,10 +1340,20 @@ def update_memory(
                 "message": f"No memory found with ID '{memory_id}'. Use get_all_memories to list all memories."
             }, indent=2)
 
+        # Build response with actual updated values (not just keys)
+        updates_applied = {}
+        if converted_updates:
+            for k, v in converted_updates.items():
+                try:
+                    parsed_val = json.loads(v) if isinstance(v, str) else v
+                    updates_applied[k] = parsed_val
+                except (json.JSONDecodeError, TypeError):
+                    updates_applied[k] = v
+
         return json.dumps({
             "status": "success" if success else "not_found",
             "message": f"Memory {'updated successfully' if success else 'not found'} with ID '{memory_id}'",
-            "updates_applied": list(update_dict.keys()) if update_dict else []
+            "updates_applied": updates_applied if converted_updates else {}
         }, indent=2)
     except sqlite3.OperationalError as e:
         if "unable to open database file" in str(e):
