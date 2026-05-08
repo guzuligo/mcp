@@ -14,7 +14,7 @@ The system follows a **database-style approach** where all memories are stored i
 - **Better performance**: SQL queries vs regex/string matching
 - **ACID transactions**: Data integrity guaranteed
 - **Efficient searching**: Single SELECT across all fields instead of multiple passes
-- **Reduced I/O**: `include_summary=False` default reduces data transfer cost
+- **Reduced I/O**: `details_level` parameter controls output detail
 - **Scalability**: SQLite handles large datasets better than in-memory JSON
 
 ### Database Schema
@@ -24,68 +24,72 @@ The database is stored in a single file (`~/.swordmemory/memory.db`) with the fo
 ```sql
 CREATE TABLE memories (
     id TEXT PRIMARY KEY,                    -- YYMMDDhhmmss format timestamp-based ID
-    keyword TEXT NOT NULL UNIQUE,           -- Unique keyword/ID for this memory
     title TEXT NOT NULL,                     -- Short descriptive title
     summary TEXT NOT NULL,                   -- Detailed description with specific details
-    memory_types TEXT NOT NULL DEFAULT '[]', -- JSON array string: '["personal","technical"]'
-    related_ids TEXT NOT NULL DEFAULT '[]', -- JSON array string: '["id1","id2"]'
-    related_items TEXT NOT NULL DEFAULT '[]', -- JSON array string for batch updates
+    memory_type INTEGER NOT NULL DEFAULT 0,  -- Integer type code (see MEMORY TYPE CODES below)
+    related_ids TEXT NOT NULL DEFAULT '[]',  -- JSON array string: '["id1","id2"]'
     keywords TEXT NOT NULL DEFAULT '[]',     -- Semantic keywords for searching
     created_at TEXT NOT NULL,              -- ISO format timestamp of creation
     updated_at TEXT NOT NULL                -- ISO format timestamp of last update
 );
 
 -- Indexes for fast lookups
-CREATE INDEX idx_memories_keyword ON memories(keyword);
 CREATE INDEX idx_memories_id ON memories(id);
 CREATE INDEX idx_memories_created_at ON memories(created_at);
 ```
 
 **IMPORTANT NOTES FOR LLMs:**
-- `memory_types`, `related_ids`, `related_items`, and `keywords` are stored as **JSON array strings** (e.g., `'["personal","technical"]'`)
+- `related_ids` and `keywords` are stored as **JSON array strings** (e.g., `'["personal","technical"]'`)
 - Use `json_each()` for SQL-based array membership checks:
   ```sql
-  SELECT * FROM memories, json_each(memory_types) WHERE json_each.value = 'personal'
+  SELECT * FROM memories, json_each(keywords) WHERE json_each.value = 'debugging'
   ```
-- All queries should specify columns explicitly (avoid `SELECT *`):
-  - Default: exclude the `summary` field to reduce I/O cost
-  - Use `include_summary=True` parameter when full details are needed
+- All queries should specify columns explicitly (avoid `SELECT *`)
+- Use `details_level` parameter to control output detail
 
 ### Memory Record Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | string (YYMMDDhhmmss) | Timestamp-based unique identifier (e.g., 260506193000 for 2026-05-06 19:30:00) |
-| `keyword` | string | Unique identifier/ID that also acts as a title reference |
-| `title` | string | Short descriptive title - should be expressive enough to help determine if reading the summary is needed. Think of it as a "should I read more?" indicator. Make it descriptive but concise. |
-| `summary` | string | Detailed description of the experience/knowledge. **IMPORTANT**: Include specific details like dates, numbers, links, names, and any non-general information that shouldn't get lost. The summary should summarize what was learned from the conversation. |
-| `memory_types` | array of strings (stored as JSON) | Category tags for grouping related memories across users |
+| `title` | string | Short descriptive title - should be expressive enough to help determine if reading the summary is needed. Think of it as a "should I read more?" indicator. |
+| `summary` | string | Detailed description of the experience/knowledge. **IMPORTANT**: Include specific details like dates, numbers, links, names, and any non-general information. |
+| `memory_type` | integer | Type code: 0=Unspecified, 1=Personal, 2=Document, 3=Reference, 4=Chat, 5=Chitchat, 6=Technical, 7-99=Reserved, 100+=User-defined |
 | `related_ids` | array of strings (stored as JSON) | List of other memory IDs this is related to |
-| `related_items` | array of strings (stored as JSON) | GROUP of related memory IDs that should be updated together as a batch when one is modified |
-| `keywords` | array of strings (stored as JSON) | SEMANTIC KEYWORDS/PHRASES useful for SEARCHING and MATCHING. These are terms the user might remember and search by later. Include product names, technical terms, key concepts, or phrases that capture the essence of this memory. This field is PRIMARY for semantic recall. |
+| `keywords` | array of strings (stored as JSON) | SEMANTIC KEYWORDS/PHRASES useful for SEARCHING and MATCHING |
 | `created_at` | string (ISO) | Timestamp when the memory was created |
 | `updated_at` | string (ISO) | Timestamp of last update |
 
-### Memory Type Tags
+### Memory Type Codes
 
-Each memory item can have **multiple type tags** for flexible grouping. This ensures that even if multiple users use the system, their memories won't get mixed up.
+Each memory has a **single integer type code** for categorization:
 
-| Tag | Description | Use Case |
-|-----|-----------|----------|
-| `personal` | User's name, age, facts about the user | When user talked about themselves |
-| `document` / `reference` | Memories from provided documents or referenced pages | When a document was provided or a page was discussed |
-| `chat` / `chitchat` | General conversation (lower priority) | Casual conversation without important content |
-| `technical` | Technical details, code snippets, configurations | Programming-related discussions |
+| Code | Name | Description |
+|------|------|-------------|
+| **0** | Unspecified | Default type when no specific category applies |
+| **1** | Personal | Related to the user: their life, feelings, experiences, relationships, personal goals |
+| **2** | Document | Summary or information extracted from a specific document provided to the LLM |
+| **3** | Reference | General knowledge reference: internet search results, pasted content from external sources |
+| **4** | Chat | General conversation without a specific topic or purpose |
+| **5** | Chitchat | Casual conversation, not significant, nothing new was learned |
+| **6** | Technical | Coding sessions, git repos, programming languages, math, science, new procedures |
+| **7-99** | Reserved | Reserved for future built-in use |
+| **100** | Custom Index | Use this memory's keywords to define your custom type meanings (e.g., `["101=Health", "102=Finance"]`) |
+| **101+** | User-Defined | Custom types defined by the user (meanings defined via type 100 memories) |
 
-**Example**: A memory about fixing a bug while discussing a document could have tags: `["personal", "document", "technical"]`.
+**Usage Examples:**
+- A personal diary entry: `memory_type=1`
+- A summary of a research paper: `memory_type=2`
+- An internet search result about cooking: `memory_type=3`
+- A casual chat with no specific topic: `memory_type=4`
+- Small talk that isn't significant: `memory_type=5`
+- A coding tutorial or technical guide: `memory_type=6`
 
 ## Database Initialization and Error Handling
 
 ### Automatic DB Initialization
 
-Each tool function automatically initializes the database if it doesn't exist. The system handles two cases for the database path:
-- If `DB_FILE` ends with `/` or `\`, it's treated as a directory and `memory.db` is appended to form the file path
-- Otherwise, `DB_FILE` is used as the full file path directly
+Each tool function automatically initializes the database if it doesn't exist. The system also automatically repairs any malformed data in existing records.
 
 ### Error Handling Pattern
 
@@ -106,69 +110,65 @@ This provides clear, actionable feedback to the LLM instead of a generic SQLite 
 
 | Method | Description |
 |--------|-------------|
-| `ensure_db_initialized()` | Ensures the database file exists and is initialized. Creates the DB file if it doesn't exist, then initializes the schema. Raises FileNotFoundError if the parent directory can't be created. |
+| `ensure_db_initialized()` | Ensures the database file exists, initializes schema, and repairs any malformed data |
 | `_check_db_exists()` | Returns True if the DB file exists or can be created, False otherwise |
-| `_get_connection_safe()` | Gets a SQLite connection with proper settings and error handling. Returns (conn, None) on success or (None, error_message) if the DB file doesn't exist yet. |
+| `_get_connection_safe()` | Gets a SQLite connection with proper settings and error handling |
+| `repair_database()` | Scans all records and fixes malformed JSON fields automatically |
 
 ## API Reference
 
 ### Core Methods (MemoryLite Class)
 
-#### `save_memory(keyword, title, summary, types, related_ids, related_items, important_keywords)`
-Saves a new memory item to the database. Uses YYMMDDhhmmss format for memory IDs with sequence counter for same-second creations.
+#### `save_memory(title, summary, memory_type, related_ids, important_keywords)`
+Saves a new memory item to the database. Uses YYMMDDhhmmss format for memory IDs.
 
 ```sql
-INSERT INTO memories (id, keyword, title, summary, memory_types, related_ids, related_items, keywords, created_at, updated_at)
-VALUES (?, ?, ?, ?, '["personal"]', '[]', '[]', '[]', ?, ?)
+INSERT INTO memories (id, title, summary, memory_type, related_ids, keywords, created_at, updated_at)
+VALUES (?, ?, ?, 0, '[]', '[]', ?, ?)
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| keyword | str | Unique identifier/ID for this memory item |
 | title | str | Descriptive title (acts as "should I read more?" indicator) |
 | summary | str | Detailed description with specific details (dates, numbers, links, names). Should contain specifics that won't be obvious from reading just the title. |
-| types | list[str] | Category tags: ["personal", "document", "reference", "chat", "chitchat", "technical"] |
+| memory_type | int | Integer type code (0-99 reserved, 100+ user-defined). See Memory Type Codes section above. |
 | related_ids | list[str] | List of other memory IDs this is related to |
-| related_items | list[str] | GROUP of related memory IDs that should be updated together as a batch when one is modified |
-| important_keywords | list[str] | SEMANTIC KEYWORDS/PHRASES useful for SEARCHING and MATCHING. Include product names, technical terms, key concepts, or phrases that capture the essence of this memory. This field is PRIMARY for semantic recall - populate it with words/phrases a user would naturally use when remembering or searching for this memory later. |
+| important_keywords | list[str] | SEMANTIC KEYWORDS/PHRASES useful for SEARCHING and MATCHING |
 
-#### `get_memory_by_id(memory_id)`
-Retrieves a specific memory by its unique ID. Returns the full memory record or None.
-
-```sql
-SELECT * FROM memories WHERE id = ?
--- Or without summary (default):
-SELECT id, keyword, title, memory_types, related_ids, related_items, keywords, created_at, updated_at FROM memories WHERE id = ?
-```
-
-#### `get_memories_by_ids(memory_ids)`
-Retrieves multiple memories by their IDs. Accepts a list of UUID4 strings.
+#### `get_memory_by_id(memory_id, details_level=2)`
+Retrieves a specific memory by its unique ID.
 
 ```sql
-SELECT id, keyword, title, ... FROM memories WHERE id IN (?, ?, ?)
+SELECT id, title, summary, memory_type, related_ids, keywords, created_at, updated_at FROM memories WHERE id = ?
 ```
 
-#### `get_memory_by_keyword(keyword)`
-Retrieves a specific memory by its keyword/ID. Returns the full memory record or None.
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| memory_id | str | The unique identifier of the memory |
+| details_level | int | 0=minimal (title+keywords only), 1=excludes summary (default: 2=full) |
+
+#### `get_memories_by_ids(memory_ids, details_level=1)`
+Retrieves multiple memories by their IDs.
 
 ```sql
-SELECT * FROM memories WHERE keyword = ?
+SELECT id, title, memory_type, related_ids, keywords, created_at, updated_at FROM memories WHERE id IN (?, ?, ?)
 ```
 
-#### `search(pattern=None, types=None, keyword=None, include_summary=False, wordJoin="OR")`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| memory_ids | list[str] | List of unique identifiers to retrieve |
+| details_level | int | 0=minimal, 1=excludes summary (default), 2=full |
+
+#### `search(pattern=None, memory_type=None, details_level=1, wordJoin="OR")`
 Searches memories across ALL text fields in a SINGLE query:
 
 ```sql
 -- Search by pattern (matches any field) - OR mode (default): Each word searched independently
-SELECT id, keyword, title, ... FROM memories 
-WHERE title LIKE '%pattern%' OR summary LIKE '%pattern%' OR keyword LIKE '%pattern%'
+SELECT id, title, ... FROM memories 
+WHERE title LIKE '%pattern%' OR summary LIKE '%pattern%' OR keywords LIKE '%pattern%'
 
--- Filter by type tags using json_each
-SELECT id, keyword, title, ... FROM memories, json_each(memory_types) 
-WHERE json_each.value = 'personal'
-
--- Exact keyword match
-SELECT * FROM memories WHERE keyword = ?
+-- Filter by memory type
+SELECT * FROM memories WHERE memory_type = 1
 
 -- AND mode: Each word must appear in each field
 title LIKE '%word1%' AND summary LIKE '%word2%' AND keywords LIKE '%word3%'
@@ -177,37 +177,38 @@ title LIKE '%word1%' AND summary LIKE '%word2%' AND keywords LIKE '%word3%'
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | pattern | str | Text to search for (each space-separated token becomes a separate LIKE condition) |
-| types | list[str] | Filter by type tags (e.g., ["personal"]) |
-| keyword | str | Exact keyword match |
-| include_summary | bool | Whether to include the summary field (default: False) |
+| memory_type | int | Filter by memory type code (0-6 for built-in types) |
+| details_level | int | 0=minimal, 1=excludes summary (default), 2=full |
 | wordJoin | str | How to combine multi-word patterns - "OR" (any word matches, default) or "AND" (all words must match) |
 
-Returns list of matching memory records.
-
-#### `get_all_memories(include_summary=False)`
-Gets all stored memories. By default, the `summary` field is excluded to reduce I/O cost.
+#### `get_all_memories(details_level=1)`
+Gets all stored memories. Use `details_level` to control output detail.
 
 ```sql
--- Default (without summary):
-SELECT id, keyword, title, memory_types, related_ids, related_items, keywords, created_at, updated_at FROM memories ORDER BY created_at DESC
+-- Default (details_level=1, without summary):
+SELECT id, title, memory_type, related_ids, keywords, created_at, updated_at FROM memories ORDER BY created_at DESC
 
--- With summary:
-SELECT id, keyword, title, summary, memory_types, related_ids, related_items, keywords, created_at, updated_at FROM memories ORDER BY created_at DESC
+-- Full (details_level=2):
+SELECT id, title, summary, memory_type, related_ids, keywords, created_at, updated_at FROM memories ORDER BY created_at DESC
 ```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| details_level | int | 0=minimal (title+keywords only), 1=excludes summary (default), 2=full |
 
 #### `update_memory(memory_id, updates)`
 Updates an existing memory record. Returns True if updated successfully.
 
 ```sql
-UPDATE memories SET keyword = ?, title = ?, ... , updated_at = ? WHERE id = ?
+UPDATE memories SET title = ?, summary = ?, ... , updated_at = ? WHERE id = ?
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | memory_id | str | The unique identifier of the memory to update |
-| updates | dict | Dictionary of fields to update (e.g., {"title": "New Title"}) |
+| updates | dict | Dictionary of fields to update (e.g., `{"title": "New Title", "memory_type": 2}`) |
 
-Valid keys for updates: `keyword`, `title`, `summary`, `memory_types`, `related_ids`, `related_items`, `keywords`
+Valid keys for updates: `title`, `summary`, `memory_type`, `related_ids`, `keywords`
 
 #### `delete_memory(memory_id)`
 Deletes a specific memory by ID. Returns True if deleted successfully.
@@ -217,54 +218,48 @@ DELETE FROM memories WHERE id = ?
 ```
 
 #### `get_memory_stats()`
-Returns statistics about the database including counts per type tag.
+Returns statistics about the database including counts per type code.
 
 ```sql
 SELECT COUNT(*) FROM memories
--- Per-type counts using json_each:
-SELECT COUNT(DISTINCT id FROM memories, json_each(memory_types) WHERE json_each.value = 'personal'
+SELECT COUNT(*) FROM memories WHERE memory_type = 1
 ```
 
-#### `get_all_types()` [NEW]
-Gets all unique type tags used in the database with their counts.
+#### `get_all_types()`
+Gets all unique memory type codes used in the database with their counts.
 
 ```sql
-SELECT json_each.value as type_name, COUNT(DISTINCT id as count 
-FROM memories, json_each(memory_types) 
-GROUP BY type_name
+SELECT memory_type, COUNT(*) as count FROM memories GROUP BY memory_type ORDER BY memory_type
 ```
 
-#### `get_all_keywords(pattern=None)` [NEW]
+#### `get_all_keywords(pattern=None)`
 Lists all keywords and titles, optionally filtered by pattern.
 
 ```sql
-SELECT keyword, title FROM memories GROUP BY keyword ORDER BY keyword
--- With filter:
-SELECT keyword, title FROM memories WHERE keyword LIKE ? OR title LIKE ? GROUP BY keyword ORDER BY keyword
+SELECT title, keywords FROM memories WHERE title LIKE ? GROUP BY id ORDER BY created_at DESC
 ```
 
-#### `get_all_words(pattern=None)` [NEW]
-Extracts all words from every text field in the database. Scans title, summary, keyword, memory_types, related_ids, related_items, and keywords fields. Returns a breakdown of which words appear in which fields.
+#### `get_all_words(pattern=None)`
+Extracts all words from every text field in the database. Scans title, summary, and keywords fields. Returns a breakdown of which words appear in which fields.
 
-**NOTE**: This is an EXPENSIVE operation as it must fetch all records with their full text. Use only when a deep word-level search is required. For most use cases, `get_all_keywords()` or `search()` should be preferred for better performance.
+**NOTE**: This is an EXPENSIVE operation as it must fetch all records with their full text. Use only when a deep word-level search is required.
 
 ### FastMCP Tools
 
-All tools return JSON strings for MCP compatibility. Each tool function catches `sqlite3.OperationalError` and checks for "unable to open database file" errors, returning a descriptive message ("Database not yet initiated. Save a memory first.") instead of letting the generic SQLite error propagate.
+All tools return JSON strings for MCP compatibility. Each tool function catches `sqlite3.OperationalError` and checks for "unable to open database file" errors.
 
 | Tool Name | Description | Key Parameters |
 |-----------|-------------|----------------|
-| `save_memory` | Save a new memory item | keyword, title, summary, types (JSON array string), related_ids, related_items, keywords |
-| `get_memory_by_id` | Retrieve specific memory by ID | memory_id |
-| `get_memories_by_ids` | Retrieve multiple memories by IDs | Comma-separated string of IDs |
-| `get_memory_by_keyword` | Retrieve specific memory by keyword | keyword |
-| `search` | Search memories across all fields in single query | pattern (text to search), types (JSON array string), keyword, wordJoin ("OR"/"AND") |
-| `get_all_memories` | Get all stored memories (without summary) | None |
-| `get_all_types` | Show available type tags with counts | None |
+| `save_memory` | Save a new memory item | title, summary, memory_type (int or name string), related_ids, keywords |
+| `get_memory_by_id` | Retrieve specific memory by ID | memory_id, details_level (default: 2) |
+| `get_memories_by_ids` | Retrieve multiple memories by IDs | memory_ids_str (comma-separated), details_level (default: 1) |
+| `search` | Search memories across all fields | pattern, memory_type, details_level (default: 1), wordJoin |
+| `get_all_memories` | Get all stored memories | details_level (default: 1) |
+| `get_all_types` | Show available type codes with counts | None |
 | `get_all_keywords` | List all keywords and titles | Optional pattern filter |
 | `get_memory_stats` | View memory statistics | None |
 | `delete_memory` | Delete a memory item | memory_id |
-| `update_memory` | Update an existing memory | memory_id, updates (JSON string) |
+| `update_memory` | Update an existing memory | memory_id, updates (JSON string or dict) |
 
 ## Best Practices for LLM Usage
 
@@ -278,12 +273,16 @@ All tools return JSON strings for MCP compatibility. Each tool function catches 
 - **Summarize what was learned**: The summary should capture the essence of the conversation or document
 - **Be thorough but organized**: Use paragraphs or bullet points for complex topics
 
-### Type Tag Selection
-- Choose all relevant tags for each memory item
-- Use `personal` when discussing user-specific information (name, age, preferences)
-- Use `document`/`reference` when a document was provided or referenced
-- Use `chat`/`chitchat` for casual conversation with low importance
-- Use `technical` for code, configurations, and technical discussions
+### Memory Type Selection
+Use the appropriate type code for each memory:
+- **0** = Unspecified - when no specific category applies
+- **1** = Personal - user's life, feelings, experiences, relationships
+- **2** = Document - summaries/info from specific documents provided
+- **3** = Reference - general knowledge from internet searches or external sources
+- **4** = Chat - general conversation without specific topic
+- **5** = Chitchat - casual, not significant, nothing new learned
+- **6** = Technical - coding, git repos, programming, math, science
+- **100+** = User-defined - define custom types using type 100 memories
 
 ### Keywords Guidelines
 The `keywords` field is PRIMARY for semantic recall. Populate it with the exact words/phrases you'd use if you remembered this memory later but couldn't remember its title or summary. Include:
@@ -301,35 +300,39 @@ Do NOT include:
 ### Related IDs Usage
 - Link related memories by their IDs to create memory graphs
 - Helps traverse connected knowledge across sessions
-- Use `related_items` for GROUP of related memory IDs that should be updated together as a batch when one is modified
 
-## Performance Optimizations
+## Details Level System
 
-### include_summary=False Default
-All retrieval methods default to `include_summary=False`, which means:
-- Queries explicitly list columns instead of using `SELECT *`
-- The `summary` field is excluded unless requested
-- Reduces I/O cost significantly for large datasets
+The `details_level` parameter controls what fields are returned:
 
-### Single Query Search
-The `search()` method uses a single SQL query with OR conditions across all searchable fields. This is more efficient than the old approach of multiple passes through the data.
+| Level | Fields Included | Use Case |
+|-------|----------------|----------|
+| **0** | id, title, keywords | Minimal info for quick listing |
+| **1** | id, title, memory_type, related_ids, keywords, created_at, updated_at | Summary excluded (default for bulk operations) |
+| **2** | id, title, summary, memory_type, related_ids, keywords, created_at, updated_at | Full details including summary |
 
-### json_each for Type Filtering
-Type filtering uses SQLite's `json_each()` function:
-```sql
-SELECT id FROM memories, json_each(memory_types WHERE json_each.value = 'personal'
-```
+**Performance**: Level 0 and 1 reduce I/O by excluding the summary field, which is typically the largest field.
 
 ## Extending the System
 
-### Adding New Type Tags
-Modify the `VALID_TYPES` list in the `MemoryLite` class:
-```python
-VALID_TYPES = ["personal", "document", "reference", "chat", "chitchat", "technical", "new_tag"]
+### User-Defined Memory Types (100+)
+
+To create custom memory types, save a type 100 memory with keywords defining your custom codes:
+
+```
+save_memory(
+    title="Custom Type Definitions",
+    summary="Define custom memory type codes for my specific use cases",
+    memory_type=100,
+    keywords=['["101=Health", "102=Finance", "103=Education", "104=Recipes"]']
+)
 ```
 
-### Custom Queries
-All SQL queries are defined within each method. To add new search modes, create new methods following the existing patterns.
+Then use codes 101, 102, 103, 104 for your custom categories.
+
+### Adding Repair Functions
+
+The system automatically repairs malformed data on initialization. No manual intervention needed.
 
 ## File Structure
 
@@ -346,22 +349,20 @@ from memorylite import MemoryLite
 # Create instance
 mem = MemoryLite()
 
-# Save a new memory
+# Save a new memory (memory_type=6 for technical)
 result = mem.save_memory(
-    keyword="debugging_tip",
     title="Debugging: Check Logs Before Making Changes",
     summary="When debugging, always check the application logs first. Specific detail: The error was in /var/log/app.log line 42.",
-    types=["technical", "personal"],
+    memory_type=6,  # Technical
     related_ids=[],
-    related_items=[],
     important_keywords=["debugging", "logs", "best-practice"]
 )
 
-# Retrieve by keyword (without summary by default)
-memory = mem.get_memory_by_keyword("debugging_tip")
+# Retrieve by ID (full details)
+memory = mem.get_memory_by_id(result["id"], details_level=2)
 
-# Search across all fields in single query
-results = mem.search(pattern="application logs")
+# Search across all fields
+results = mem.search(pattern="application logs", details_level=1)
 
 # Get all types with counts
 all_types = mem.get_all_types()
@@ -394,9 +395,11 @@ python memorylite.py                                # Use default ~/.swordmemory
 |--------|-----------------|---------------------|
 | Storage | Single JSON file (`memory.json`) | SQLite database (`memory.db`) |
 | Search | Regex + string matching in Python | SQL SELECT with WHERE/LIKE/IN clauses |
-| Indexes | In-memory dicts (`by_id`, `by_keyword`, `by_types`) | Database-level B-tree indexes |
+| Indexes | In-memory dicts (`by_id`, `by_keyword`) | Database-level B-tree indexes |
 | Transactions | Manual file read/write | ACID transactions via SQLite |
-| I/O Cost | Always includes full records | `include_summary=False` by default |
+| Type System | JSON array of strings | Single integer type code |
+| Related Items | Separate field | Removed (use related_ids) |
+| Detail Control | include_summary (boolean) | details_level (0/1/2) |
 | Query Style | Multiple passes over data | Single query across all fields |
 
 ## Troubleshooting
@@ -411,25 +414,21 @@ When the database doesn't exist yet, each tool function catches the `sqlite3.Ope
 }
 ```
 
-This provides clear, actionable feedback to the LLM instead of a generic SQLite error that would cause unnecessary retries. The `save_memory` tool calls `ensure_db_initialized()` which creates the directory and initializes the schema if needed.
+This provides clear, actionable feedback to the LLM instead of a generic SQLite error.
 
-### Database Not Found
-The database is automatically created at `~/.swordmemory/memory.db`) on first use. If it doesn't exist, the `_init_db()` method creates the schema.
+### Malformed Data Handling
 
-### Type Filtering Issues
-Remember that `memory_types` is stored as a JSON array string. To check if a type exists:
-```sql
--- Correct way using json_each:
-SELECT * FROM memories, json_each(memory_types) WHERE json_each.value = 'personal'
-
--- NOT this (won't work for arrays):
-WHERE memory_types LIKE '%personal%'  -- May match partial strings
-```
+The system automatically repairs malformed JSON data in `related_ids` and `keywords` fields on each initialization. Common issues fixed:
+- Single quotes instead of double quotes
+- `None` instead of `null`
+- Empty strings
+- Non-list values
 
 ### Summary Field Not Included
-By default, all retrieval methods exclude the `summary` field. To include it:
-- Use `get_memory_by_id()` which includes full records by default
-- Or pass `include_summary=True` to methods that support this parameter
+
+By default, `get_all_memories` uses `details_level=1` which excludes the summary. To include it:
+- Use `details_level=2` for full details
+- Use `get_memory_by_id()` which defaults to `details_level=2`
 
 ## Error Handling Details
 
@@ -442,7 +441,6 @@ Each tool function implements consistent error handling:
 Example error handling pattern:
 ```python
 try:
-    # Database operation
     result = mem.get_memory_by_id(memory_id)
 except sqlite3.OperationalError as e:
     if "unable to open database file" in str(e):

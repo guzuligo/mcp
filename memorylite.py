@@ -2,7 +2,7 @@
 memorylite - Lightweight LLM Memory Database System (SQLite Backend)
 
 Replaces JSON file storage with SQLite for better query performance,
-transactional safety, and SQL-based searching instead of regex/string matching.
+transactional safety, and SQL-based searching instead of regex/string_matching.
 
 MIGRATION GUIDE (from memorydb):
     JSON file (.json  →  SQLite database (.db)
@@ -13,40 +13,52 @@ MIGRATION GUIDE (from memorydb):
 DATABASE SCHEMA:
     CREATE TABLE memories (
         id TEXT PRIMARY KEY,                                    -- YYMMDDhhmmss format timestamp-based ID (e.g., 260506193000 = 2026-05-06 19:30:00)
-        keyword TEXT NOT NULL UNIQUE,                           -- Unique keyword/ID for this memory
         title TEXT NOT NULL,                                     -- Short descriptive title (acts as 'should I read more?' indicator)
         summary TEXT NOT NULL,                                   -- Detailed description with specific details
-        memory_types TEXT NOT NULL,                              -- JSON array string: '["personal","technical"]'
-        related_ids TEXT NOT NULL,                               -- JSON array string: ['id1','id2'] - single related item reference
-        related_items TEXT NOT NULL,                             -- JSON array string: ['id1','id2','id3'] - batch of related items for group updates
-        keywords TEXT NOT NULL,                                   -- JSON array string: '["kw1","kw2"]'
+        memory_type INTEGER NOT NULL DEFAULT 0,                  -- Integer type code (see MEMORY TYPE CODES below)
+        related_ids TEXT NOT NULL DEFAULT '[]',                  -- JSON array string: ['id1','id2'] - related memory IDs
+        keywords TEXT NOT NULL DEFAULT '[]',                      -- JSON array string: '["kw1","kw2"]' - semantic keywords
         created_at TEXT NOT NULL,                               -- ISO format timestamp of creation
         updated_at TEXT NOT NULL                                -- ISO format timestamp of last update
     );
 
+    MEMORY TYPE CODES (memory_type):
+        RESERVED TYPES (0-6) - Built-in categories:
+          0 = Unspecified — Default type when no specific category applies
+          1 = Personal — Related to the user: their life, feelings, experiences, relationships, personal goals
+          2 = Document — Summary or information extracted from a specific document provided to the LLM
+          3 = Reference — General knowledge reference: internet search results, pasted content from external sources
+          4 = Chat — General conversation without a specific topic or purpose
+          5 = Chitchat — Casual conversation, not significant, nothing new was learned
+          6 = Technical — Coding sessions, git repos, programming languages, math, science, new procedures
+
+        RESERVED RANGE (7-99) — Reserved for future built-in use
+
+        USER-DEFINED RANGE (100+) — Custom types defined by the user:
+          100 = Custom type index memory — Use this memory's keywords to define your custom type meanings
+                Example: keywords: '["101=Health", "102=Finance", "103=Education"]'
+          101+ = User-defined custom types — Reference the meanings defined in your type 100 memory
+
     NOTE ABOUT EACH FIELD'S PURPOSE FOR LLMs:
-      - keyword: Unique identifier/ID for this memory (auto-generated or manually set)
+      - id: Unique identifier for this memory (YYMMDDhhmmss format)
       - title: Short descriptive heading that summarizes what the memory is about
       - summary: Detailed description with specific details (dates, numbers, links, names)
                  Should contain specifics that won't be obvious from reading just the title.
-      - memory_types: Categorization tags for filtering/grouping (e.g., personal, document, reference)
+      - memory_type: Integer type code for filtering/grouping (see type codes above)
       - related_ids: Links to other memories by their ID for establishing connections
-      - related_items: GROUP of related memory IDs that should be updated together as a batch when one is modified
       - keywords: SEMANTIC KEYWORDS/PHRASES useful for SEARCHING and MATCHING
                  These are terms the user might remember and search by later. Include product names,
                  technical terms, key concepts, or phrases that capture the essence of this memory.
-                 This field is PRIMARY for semantic recall - populate it with words/phrases a user
-                 would naturally use when remembering or searching for this memory later.
+                 For user-defined types (100+), type 100 memories use keywords to define type meanings.
 
-    CREATE INDEX idx_memories_keyword ON memories(keyword);
     CREATE INDEX idx_memories_id ON memories(id);
     CREATE INDEX idx_memories_created_at ON memories(created_at);
 
-    NOTE: memory_types, related_ids, related_items, keywords are stored as JSON array strings.
-          Use json_each() for SQL-based array membership checks (e.g., checking if a type exists).
+    NOTE: related_ids and keywords are stored as JSON array strings.
+          Use json_each() for SQL-based array membership checks.
 
-    ALL QUERIES SHOULD SPECIFY COLUMNS EXPLICITLY (avoid SELECT *) and use include_summary 
-    parameter to conditionally include the summary field (default: False) to reduce I/O cost.
+    ALL QUERIES SHOULD SPECIFY COLUMNS EXPLICITLY (avoid SELECT *) and use details_level 
+    parameter to control output detail (0=minimal, 1=excludes summary, 2=full).
 """
 
 import argparse
@@ -63,6 +75,28 @@ from fastmcp import FastMCP
 _db_lock = threading.Lock()
 
 mcp = FastMCP("memorylite")
+
+
+# Memory type code mapping: number -> (name, description)
+MEMORY_TYPE_MAP = {
+    0: ("unspecified", "Default type when no specific category applies"),
+    1: ("personal", "Related to the user: their life, feelings, experiences, relationships, personal goals"),
+    2: ("document", "Summary or information extracted from a specific document provided to the LLM"),
+    3: ("reference", "General knowledge reference: internet search results, pasted content from external sources"),
+    4: ("chat", "General conversation without a specific topic or purpose"),
+    5: ("chitchat", "Casual conversation, not significant, nothing new was learned"),
+    6: ("technical", "Coding sessions, git repos, programming languages, math, science, new procedures, technical references"),
+}
+
+# Reserved range: 7-99 (available for future use)
+MEMORY_TYPE_RESERVED_START = 7
+MEMORY_TYPE_RESERVED_END = 99
+
+# User-defined range: 100+ (user defines meanings via type 100 memories)
+MEMORY_TYPE_USER_DEFINED_START = 100
+
+# Reverse mapping: lowercase name -> number
+MEMORY_TYPE_REVERSE = {v[0].lower(): k for k, v in MEMORY_TYPE_MAP.items()}
 
 
 def _parse_json_or_fix(input_str: str) -> Any:
@@ -181,7 +215,135 @@ def _parse_json_dict_or_fix(input_str: str) -> Any:
     return {}
 
 
-mcp = FastMCP("memorylite")
+def _convert_to_memory_type(types_input) -> int:
+    """Convert various input formats to a single memory type integer.
+    
+    Handles:
+    - Integer values directly (0-99 reserved, 100+ user-defined)
+    - String type names (e.g., "personal", "DOCUMENT")
+    - String type codes (e.g., "0", "3", "150")
+    - List of type names (takes first valid one)
+    - List of type numbers (takes first valid one)
+    - None or empty -> 0 (unspecified)
+    
+    Returns:
+        int: Memory type code (0-99 reserved, 100+ user-defined), defaults to 0 for invalid input
+    """
+    # Handle None or empty
+    if types_input is None:
+        return 0
+    
+    # Handle list - take first element
+    if isinstance(types_input, (list, tuple)):
+        if len(types_input) == 0:
+            return 0
+        types_input = types_input[0]
+    
+    # Handle integer directly
+    if isinstance(types_input, int):
+        if types_input >= 0:
+            return types_input
+        return 0  # Negative, default to unspecified
+    
+    # Handle string input
+    if isinstance(types_input, str):
+        types_input = types_input.strip()
+        if not types_input:
+            return 0
+        
+        # Try as numeric code first (supports 0-99 reserved, 100+ user-defined)
+        try:
+            code = int(types_input)
+            if code >= 0:
+                return code
+            return 0
+        except ValueError:
+            pass
+        
+        # Try as type name (case-insensitive) - only for reserved types 0-6
+        lower_name = types_input.lower().strip()
+        if lower_name in MEMORY_TYPE_REVERSE:
+            return MEMORY_TYPE_REVERSE[lower_name]
+        
+        # Try partial matching (e.g., "personal" matches "personal", "chat" matches "chitchat")
+        for name, code in MEMORY_TYPE_REVERSE.items():
+            if lower_name == name or name.startswith(lower_name) or lower_name.startswith(name):
+                return code
+        
+        # Invalid type name, default to 0
+        return 0
+    
+    # Fallback for unexpected types
+    return 0
+
+
+def _convert_memory_type_to_name(type_code: int) -> str:
+    """Convert a memory type integer to its name string."""
+    if type_code in MEMORY_TYPE_MAP:
+        return MEMORY_TYPE_MAP[type_code][0]
+    elif MEMORY_TYPE_RESERVED_START <= type_code <= MEMORY_TYPE_RESERVED_END:
+        return f"reserved-{type_code}"
+    elif type_code >= MEMORY_TYPE_USER_DEFINED_START:
+        return f"custom-{type_code}"
+    return "unspecified"
+
+
+def _convert_memory_type_to_description(type_code: int) -> str:
+    """Convert a memory type integer to its description string."""
+    if type_code in MEMORY_TYPE_MAP:
+        return MEMORY_TYPE_MAP[type_code][1]
+    elif MEMORY_TYPE_RESERVED_START <= type_code <= MEMORY_TYPE_RESERVED_END:
+        return "Reserved for future use"
+    elif type_code >= MEMORY_TYPE_USER_DEFINED_START:
+        if type_code == MEMORY_TYPE_USER_DEFINED_START:
+            return "User-defined custom type index (use keywords to define custom type meanings)"
+        return "User-defined custom type"
+    return "Unknown type"
+
+
+def get_memory_type_info(type_code: int) -> dict:
+    """Get complete information about a memory type code.
+    
+    Args:
+        type_code: Integer type code (0-99 reserved, 100+ user-defined)
+        
+    Returns:
+        Dict with code, name, and description
+    """
+    return {
+        "type": type_code,
+        "name": _convert_memory_type_to_name(type_code),
+        "description": _convert_memory_type_to_description(type_code)
+    }
+
+
+def get_all_memory_type_info() -> list:
+    """Get information about all reserved memory types.
+    
+    Returns:
+        List of dicts with complete type information for all reserved types (0-99) plus user-defined range
+    """
+    result = []
+    
+    # Reserved types 0-6 (defined)
+    for code in range(0, 7):
+        result.append(get_memory_type_info(code))
+    
+    # Reserved types 7-99
+    result.append({
+        "type": f"{MEMORY_TYPE_RESERVED_START}-{MEMORY_TYPE_RESERVED_END}",
+        "name": "reserved-range",
+        "description": "Reserved for future built-in use"
+    })
+    
+    # User-defined range
+    result.append({
+        "type": f"{MEMORY_TYPE_USER_DEFINED_START}+",
+        "name": "user-defined",
+        "description": "User-defined custom types. Use type 100 memories to define your custom type meanings via keywords."
+    })
+    
+    return result
 
 
 class MemoryLite:
@@ -189,8 +351,6 @@ class MemoryLite:
 
     # Configuration - can be modified at the top level
     DB_FILE = None  # Will default to ~/.swordmemory/memory.db if not set
-
-    VALID_TYPES = ["personal", "document", "reference", "chat", "chitchat", "technical"]
 
     def _get_db_path(self) -> Path:
         """Get the path to the database file.
@@ -234,6 +394,7 @@ class MemoryLite:
         """Ensure the database file exists and is initialized.
         
         Creates the DB file if it doesn't exist, then initializes the schema.
+        Also repairs any malformed data in existing records.
         Raises FileNotFoundError if the parent directory doesn't exist or can't be created.
         """
         db_path = self._get_db_path()
@@ -251,6 +412,7 @@ class MemoryLite:
                 parent_dir.mkdir(parents=True, exist_ok=True)
         
         self._init_db()
+        self.repair_database()
 
     def _get_connection_safe(self) -> sqlite3.Connection:
         """Get a SQLite connection with proper settings and error handling.
@@ -273,21 +435,132 @@ class MemoryLite:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id TEXT PRIMARY KEY,
-                    keyword TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL,
                     summary TEXT NOT NULL,
-                    memory_types TEXT NOT NULL DEFAULT '[]',
+                    memory_type INTEGER NOT NULL DEFAULT 0,
                     related_ids TEXT NOT NULL DEFAULT '[]',
-                    related_items TEXT NOT NULL DEFAULT '[]',
                     keywords TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_memories_keyword ON memories(keyword);
                 CREATE INDEX IF NOT EXISTS idx_memories_id ON memories(id);
                 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
             """)
+
+    def repair_database(self) -> dict:
+        """Repair malformed data in existing database records.
+        
+        Scans all records and fixes any malformed JSON fields (related_ids, keywords).
+        Also handles legacy schema issues (e.g., old keyword column references).
+        
+        Returns:
+            Dict with repair statistics
+        """
+        repair_stats = {
+            "total_records": 0,
+            "fixed_records": 0,
+            "fixed_fields": {}
+        }
+        
+        db = self._get_connection()
+        try:
+            # Get all records
+            rows = db.execute(
+                "SELECT id, related_ids, keywords FROM memories"
+            ).fetchall()
+            
+            repair_stats["total_records"] = len(rows)
+            records_to_update = []
+            
+            for row in rows:
+                mem_id, related_ids, keywords = row
+                needs_fix = False
+                fixed_fields = {}
+                
+                # Fix related_ids
+                if related_ids is not None:
+                    parsed = self._safe_parse_json(related_ids, None)
+                    if parsed is None or not isinstance(parsed, list):
+                        # Try to fix common issues
+                        if isinstance(related_ids, str):
+                            # Try stripping whitespace and re-parsing
+                            stripped = related_ids.strip()
+                            if stripped:
+                                try:
+                                    parsed = json.loads(stripped)
+                                    if isinstance(parsed, list):
+                                        fixed_fields["related_ids"] = stripped
+                                        needs_fix = True
+                                except (json.JSONDecodeError, TypeError):
+                                    # Try to fix common LLM formatting issues
+                                    fixed_str = stripped.replace("'", '"').replace("None", "null")
+                                    try:
+                                        parsed = json.loads(fixed_str)
+                                        if isinstance(parsed, list):
+                                            fixed_fields["related_ids"] = fixed_str
+                                            needs_fix = True
+                                    except (json.JSONDecodeError, TypeError):
+                                        fixed_fields["related_ids"] = "[]"
+                                        needs_fix = True
+                            else:
+                                fixed_fields["related_ids"] = "[]"
+                                needs_fix = True
+                        else:
+                            fixed_fields["related_ids"] = "[]"
+                            needs_fix = True
+                
+                # Fix keywords
+                if keywords is not None:
+                    parsed = self._safe_parse_json(keywords, None)
+                    if parsed is None or not isinstance(parsed, list):
+                        if isinstance(keywords, str):
+                            stripped = keywords.strip()
+                            if stripped:
+                                try:
+                                    parsed = json.loads(stripped)
+                                    if isinstance(parsed, list):
+                                        fixed_fields["keywords"] = stripped
+                                        needs_fix = True
+                                except (json.JSONDecodeError, TypeError):
+                                    fixed_str = stripped.replace("'", '"').replace("None", "null")
+                                    try:
+                                        parsed = json.loads(fixed_str)
+                                        if isinstance(parsed, list):
+                                            fixed_fields["keywords"] = fixed_str
+                                            needs_fix = True
+                                    except (json.JSONDecodeError, TypeError):
+                                        fixed_fields["keywords"] = "[]"
+                                        needs_fix = True
+                            else:
+                                fixed_fields["keywords"] = "[]"
+                                needs_fix = True
+                        else:
+                            fixed_fields["keywords"] = "[]"
+                            needs_fix = True
+                
+                if needs_fix:
+                    records_to_update.append((mem_id, fixed_fields))
+                    repair_stats["fixed_records"] += 1
+                    for field in fixed_fields:
+                        repair_stats["fixed_fields"][field] = repair_stats["fixed_fields"].get(field, 0) + 1
+            
+            # Apply fixes
+            for mem_id, fixed_fields in records_to_update:
+                set_clause = ", ".join(f"{k} = ?" for k in fixed_fields.keys())
+                values = list(fixed_fields.values()) + [mem_id]
+                db.execute(
+                    f"UPDATE memories SET {set_clause} WHERE id = ?",
+                    tuple(values)
+                )
+            
+            if records_to_update:
+                db.commit()
+                
+        finally:
+            db.close()
+        
+        return repair_stats
 
     def _get_timestamp(self) -> str:
         """Get current UTC timestamp in ISO format."""
@@ -295,21 +568,27 @@ class MemoryLite:
 
     def save_memory(
         self,
-        keyword: str,
         title: str,
         summary: str,
-        types: List[str] = None,
+        memory_type: int = 0,
         related_ids: List[str] = None,
-        related_items: List[str] = None,
         important_keywords: List[str] = None
     ) -> dict:
         """Save a new memory item to the database.
 
-        All fields are required except related_ids and important_keywords which default to empty lists.
-        The summary should contain specific details (dates, numbers, links, names) that won't be obvious from reading just the title.
+        Args:
+            title: Short descriptive title
+            summary: Detailed description with specific details
+            memory_type: Integer type code (0-99 reserved, 100+ user-defined, see MEMORY_TYPE_MAP)
+            related_ids: List of related memory IDs
+            important_keywords: List of semantic keywords for searching
+
+        Returns:
+            dict with saved memory data
         """
-        if not types or any(t not in self.VALID_TYPES for t in types):
-            raise ValueError(f"Invalid type(s). Must be one or more of: {self.VALID_TYPES}")
+        # Validate memory_type - must be non-negative integer
+        if not isinstance(memory_type, int) or memory_type < 0:
+            memory_type = 0
 
         timestamp = self._get_timestamp()
         memory_id = self._generate_memory_id(timestamp)
@@ -318,16 +597,14 @@ class MemoryLite:
         try:
             db.execute(
                 """INSERT INTO memories 
-                   (id, keyword, title, summary, memory_types, related_ids, related_items, keywords, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (id, title, summary, memory_type, related_ids, keywords, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     memory_id,
-                    keyword,
                     title,
                     summary,
-                    json.dumps(types or []),
+                    memory_type,
                     json.dumps(related_ids or []),
-                    json.dumps(related_items or []),
                     json.dumps(important_keywords or []),
                     timestamp,
                     timestamp
@@ -339,35 +616,40 @@ class MemoryLite:
 
         return {
             "id": memory_id,
-            "keyword": keyword,
             "title": title,
             "summary": summary,
-            "memory_types": types or [],
+            "memory_type": memory_type,
+            "memory_type_name": _convert_memory_type_to_name(memory_type),
             "related_ids": related_ids or [],
-            "related_items": related_items or [],
             "keywords": important_keywords or [],
             "created_at": timestamp,
             "updated_at": timestamp,
             "status": "success"
         }
 
-    def get_memory_by_id(self, memory_id: str) -> Optional[dict]:
-        """Retrieve a specific memory by its ID."""
+    def get_memory_by_id(self, memory_id: str, details_level: int = 2) -> Optional[dict]:
+        """Retrieve a specific memory by its ID.
+
+        Args:
+            memory_id: The unique identifier of the memory
+            details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full
+        """
         db = self._get_connection()
         try:
             row = db.execute(
-                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+                f"SELECT {self._select_columns_for_level(details_level)} FROM memories WHERE id = ?",
+                (memory_id,)
             ).fetchone()
-            return self._row_to_dict(row, True) if row else None
+            return self._row_to_dict(row, details_level) if row else None
         finally:
             db.close()
 
-    def get_memories_by_ids(self, memory_ids: List[str], include_summary: bool = False) -> List[dict]:
+    def get_memories_by_ids(self, memory_ids: List[str], details_level: int = 1) -> List[dict]:
         """Retrieve multiple memories by their IDs.
 
         Args:
             memory_ids: List of unique identifiers to retrieve
-            include_summary: Whether to include the summary field (default: False)
+            details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full
 
         Returns:
             List of matching memory records
@@ -378,50 +660,39 @@ class MemoryLite:
         db = self._get_connection()
         try:
             placeholders = ','.join(['?' for _ in memory_ids])
-            query = f"SELECT {self._select_columns(include_summary)} FROM memories WHERE id IN ({placeholders})"
+            columns = self._select_columns_for_level(details_level)
+            query = f"SELECT {columns} FROM memories WHERE id IN ({placeholders})"
             rows = db.execute(query, memory_ids).fetchall()
-            return [self._row_to_dict(row, include_summary) for row in rows] if rows else []
+            return [self._row_to_dict(row, details_level) for row in rows] if rows else []
         finally:
             db.close()
 
-    def get_memory_by_keyword(self, keyword: str) -> Optional[dict]:
-        """Retrieve a specific memory by its keyword."""
-        db = self._get_connection()
-        try:
-            row = db.execute(
-                "SELECT * FROM memories WHERE keyword = ?", (keyword,)
-            ).fetchone()
-            return self._row_to_dict(row if row else None, True)
-        finally:
-            db.close()
-
-    def get_all_memories(self, include_summary: bool = False) -> List[dict]:
+    def get_all_memories(self, details_level: int = 1) -> List[dict]:
         """Get all memory items.
 
         Args:
-            include_summary: Whether to include the summary field (default: False)
+            details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full
         """
         db = self._get_connection()
         try:
-            columns = self._select_columns(include_summary)
+            columns = self._select_columns_for_level(details_level)
             rows = db.execute(
                 f"SELECT {columns} FROM memories ORDER BY created_at DESC"
             ).fetchall()
-            return [self._row_to_dict(row, include_summary) for row in rows] if rows else []
+            return [self._row_to_dict(row, details_level) for row in rows] if rows else []
         finally:
             db.close()
 
     def search(
         self,
         pattern: str = None,
-        types: List[str] = None,
-        keyword: str = None,
-        include_summary: bool = False,
+        memory_type: int = None,
+        details_level: int = 1,
         wordJoin: str = "OR"
     ) -> List[dict]:
         """Search memories across all text fields in a single query.
 
-        Searches title, summary, keyword, memory_types, and keywords.
+        Searches title, summary, and keywords.
         
         When pattern contains spaces, each space-separated token becomes a separate LIKE condition.
         The wordJoin parameter controls how these conditions are combined:
@@ -430,9 +701,8 @@ class MemoryLite:
 
         Args:
             pattern: Text to search for (each space-separated token becomes a separate LIKE condition)
-            types: Filter by type tags (e.g., ["personal"])
-            keyword: Exact keyword match
-            include_summary: Whether to include the summary field (default: False)
+            memory_type: Filter by memory type code (0-6)
+            details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full
             wordJoin: How to combine multi-word patterns - "OR" (any word matches, default) or "AND" (all words must match)
 
         Returns:
@@ -450,8 +720,7 @@ class MemoryLite:
                 if not tokens:
                     return []
                 
-                # Build OR/AND grouped conditions per field (title, summary, keyword)
-                # Each group has multiple LIKE clauses connected by the join operator
+                # Build OR/AND grouped conditions per field (title, summary, keywords)
                 for token in tokens:
                     title_cond = f"title LIKE ?"
                     summary_cond = f"summary LIKE ?"
@@ -466,23 +735,16 @@ class MemoryLite:
                         conditions.append(f"{title_cond} OR {summary_cond} OR {kw_cond}")
                         params.extend([f"%{token}%", f"%{token}%", f"%{token}%"])
 
-            if types:
-                # Filter by type tags using json_each for JSON array membership
-                for t in types:
-                    conditions.append(
-                        "id IN (SELECT id FROM memories, json_each(memory_types) WHERE json_each.value = ?)"
-                    )
-                    params.append(t)
-
-            if keyword:
-                conditions.append("keyword = ?")
-                params.append(keyword)
+            if memory_type is not None:
+                conditions.append("memory_type = ?")
+                params.append(memory_type)
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
-            query = f"SELECT {self._select_columns(include_summary)} FROM memories WHERE {where_clause}"
+            columns = self._select_columns_for_level(details_level)
+            query = f"SELECT {columns} FROM memories WHERE {where_clause}"
 
             rows = db.execute(query, params).fetchall()
-            return [self._row_to_dict(row, include_summary) for row in rows] if rows else []
+            return [self._row_to_dict(row, details_level) for row in rows] if rows else []
         finally:
             db.close()
 
@@ -500,38 +762,45 @@ class MemoryLite:
         if not isinstance(memory_id, str):
             memory_id = str(memory_id).strip() if memory_id else ""
         
-        valid_keys = ("keyword", "title", "summary", "memory_types", "related_ids", "related_items", "keywords")
+        valid_keys = ("title", "summary", "memory_type", "related_ids", "keywords")
         for key in updates.keys():
             if key not in valid_keys:
                 raise ValueError(f"Invalid field '{key}'. Valid fields are: {valid_keys}")
 
         timestamp = self._get_timestamp()
         
-        # Convert lists/strings to JSON strings where needed
-        json_fields = {"memory_types", "related_ids", "related_items", "keywords"}
-        for key in updates:
-            if key in json_fields:
-                if isinstance(updates[key], list):
-                    updates[key] = json.dumps(updates[key])
-                elif isinstance(updates[key], str):
+        # Process updates
+        processed_updates = {}
+        json_fields = {"related_ids", "keywords"}
+        
+        for key, value in updates.items():
+            if key == "memory_type":
+                # Convert to integer memory type
+                processed_updates[key] = _convert_to_memory_type(value)
+            elif key in json_fields:
+                if isinstance(value, list):
+                    processed_updates[key] = json.dumps(value)
+                elif isinstance(value, str):
                     # Already a string - try to parse as JSON, keep as-is if not valid JSON
                     try:
-                        parsed = json.loads(updates[key])
-                        # If it's already a list/dict after parsing, re-serialize it
-                        if isinstance(parsed, (list, dict)):
-                            updates[key] = json.dumps(parsed)
-                        # Otherwise keep the original string value
+                        parsed = json.loads(value)
+                        if isinstance(parsed, list):
+                            processed_updates[key] = json.dumps(parsed)
+                        else:
+                            processed_updates[key] = value
                     except (json.JSONDecodeError, TypeError):
-                        pass  # Keep as-is for non-list fields like title/summary
+                        processed_updates[key] = value
+            else:
+                processed_updates[key] = value
 
-        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        if not processed_updates:
+            return False
+
+        set_clause = ", ".join(f"{k} = ?" for k in processed_updates.keys())
         
         db = self._get_connection()
         try:
-            # Note: timestamp first, then memory_id to match the SQL placeholders
-            # The query is: SET {set_clause}, updated_at = ? WHERE id = ?
-            # So we need [all_update_values..., timestamp, memory_id]
-            values = list(updates.values()) + [timestamp, memory_id]
+            values = list(processed_updates.values()) + [timestamp, memory_id]
             rows_affected = db.execute(
                 f"UPDATE memories SET {set_clause}, updated_at = ? WHERE id = ?",
                 tuple(values)
@@ -559,14 +828,40 @@ class MemoryLite:
         try:
             total = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
             
-            # Get counts per type using json_each
+            # Get counts per reserved type (0-6)
             type_counts = {}
-            for t in self.VALID_TYPES:
+            for type_code in MEMORY_TYPE_MAP:
                 count = db.execute(
-                    "SELECT COUNT(DISTINCT memories.id) FROM memories, json_each(memory_types) WHERE json_each.value = ?",
-                    (t,)
+                    "SELECT COUNT(*) FROM memories WHERE memory_type = ?",
+                    (type_code,)
                 ).fetchone()[0]
-                type_counts[t] = {"count": count}
+                type_counts[type_code] = {
+                    "name": MEMORY_TYPE_MAP[type_code][0],
+                    "description": MEMORY_TYPE_MAP[type_code][1],
+                    "count": count
+                }
+
+            # Get counts for reserved range (7-99)
+            reserved_count = db.execute(
+                "SELECT COUNT(*) FROM memories WHERE memory_type >= ? AND memory_type <= ?",
+                (MEMORY_TYPE_RESERVED_START, MEMORY_TYPE_RESERVED_END)
+            ).fetchone()[0]
+            type_counts["reserved_range"] = {
+                "name": "reserved-range",
+                "description": "Reserved for future use (7-99)",
+                "count": reserved_count
+            }
+
+            # Get counts for user-defined range (100+)
+            custom_count = db.execute(
+                "SELECT COUNT(*) FROM memories WHERE memory_type >= ?",
+                (MEMORY_TYPE_USER_DEFINED_START,)
+            ).fetchone()[0]
+            type_counts["user_defined_range"] = {
+                "name": "user-defined",
+                "description": "User-defined custom types (100+)",
+                "count": custom_count
+            }
 
             return {
                 "total_memories": total or 0,
@@ -577,29 +872,34 @@ class MemoryLite:
             db.close()
 
     def get_all_types(self) -> List[dict]:
-        """Get all unique type tags used in the database with counts.
+        """Get all unique memory type codes used in the database with counts.
 
-        Uses json_each to extract each type from JSON array strings.
+        Returns:
+            List of dicts with type code, name, and count
         """
         db = self._get_connection()
         try:
             rows = db.execute(
-                """SELECT json_each.value as type_name, COUNT(DISTINCT memories.id) as count 
-                   FROM memories, json_each(memory_types) 
-                   GROUP BY type_name"""
+                """SELECT memory_type, COUNT(*) as count 
+                   FROM memories 
+                   GROUP BY memory_type 
+                   ORDER BY memory_type"""
             ).fetchall()
-            return [{"type": row[0], "count": row[1]} for row in rows] if rows else []
+            return [
+                {"type": row[0], "name": _convert_memory_type_to_name(row[0]), "count": row[1]}
+                for row in rows
+            ] if rows else []
         finally:
             db.close()
 
     def get_all_keywords(self, pattern: str = None) -> List[dict]:
-        """Get all keywords with optional pattern filter.
+        """Get all keyword/title pairs with optional pattern filter.
 
         Args:
-            pattern: Optional regex-like string to filter keywords by title or keyword name
+            pattern: Optional string to filter keywords by title
 
         Returns:
-            List of dicts with keyword and title info
+            List of dicts with title and keywords info
         """
         db = self._get_connection()
         try:
@@ -607,105 +907,65 @@ class MemoryLite:
             params = []
             
             if pattern:
-                where_clause += " AND (keyword LIKE ? OR title LIKE ?)"
-                params.extend([f"%{pattern}%", f"%{pattern}%"])
+                where_clause += " AND title LIKE ?"
+                params.append(f"%{pattern}%")
 
-            select_clause = "SELECT keyword, title FROM memories"
-            full_query = f"{select_clause} {where_clause} GROUP BY keyword ORDER BY keyword" if where_clause != "WHERE 1=1" else f"{select_clause} GROUP BY keyword ORDER BY keyword"
+            select_clause = "SELECT title, keywords FROM memories"
+            full_query = f"{select_clause} {where_clause} GROUP BY id ORDER BY created_at DESC"
             rows = db.execute(full_query, params).fetchall()
-            return [{"keyword": row[0], "title": row[1]} for row in rows] if rows else []
+            
+            result = []
+            for row in rows:
+                kw_list = []
+                if row[1]:
+                    try:
+                        kw_list = json.loads(row[1])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                result.append({"title": row[0], "keywords": kw_list})
+            
+            return result if result else []
         finally:
             db.close()
 
     def get_all_words(self, pattern: str = None) -> dict:
         """Extract all words from every text field in the database.
 
-        This method scans all text fields (title, summary, keyword, memory_types, related_ids, related_items, keywords)
+        This method scans all text fields (title, summary, keywords)
         and returns a breakdown of which words appear in which fields.
 
         Args:
             pattern: Optional string to filter results - only includes words containing this substring
 
         Returns:
-            Dict with field-level word breakdown:
-                {
-                    "title": ["word1", "word2"],
-                    "summary": ["word3", "word4"],
-                    "keyword": ["word5"],
-                    "memory_types": ["word6"],
-                    "related_ids": ["word7"],
-                    "related_items": ["word8"],
-                    "keywords": ["word9"]
-                }
-
-        NOTE: This is an EXPENSIVE operation as it must fetch all records with their full text.
-              Use only when a deep word-level search is required. For most use cases, 
-              get_all_keywords() or search() should be preferred for better performance.
+            Dict with field-level word breakdown
         """
         db = self._get_connection()
         try:
-            # Get all memories with title and summary (include_summary=True)
             rows = db.execute(
-                "SELECT id, keyword, title, summary, memory_types, related_ids, related_items, keywords FROM memories"
+                "SELECT id, title, summary, keywords FROM memories"
             ).fetchall()
 
             result = {
                 "title": set(),
                 "summary": set(),
-                "keyword": set(),
-                "memory_types": set(),
-                "related_ids": set(),
-                "related_items": set(),
                 "keywords": set()
             }
 
             for row in rows:
-                # row[0]=id, row[1]=keyword, row[2]=title, row[3]=summary, 
-                # row[4]=memory_types (JSON string), row[5]=related_ids, row[6]=related_items, row[7]=keywords
+                # row[0]=id, row[1]=title, row[2]=summary, row[3]=keywords
                 
-                # Extract words from each field
-                if row[2]:  # title
-                    for word in self._extract_words(row[2]):
+                if row[1]:  # title
+                    for word in self._extract_words(row[1]):
                         result["title"].add(word)
 
-                if row[3]:  # summary
-                    for word in self._extract_words(row[3]):
+                if row[2]:  # summary
+                    for word in self._extract_words(row[2]):
                         result["summary"].add(word)
 
-                if row[1]:  # keyword
-                    for word in self._extract_words(row[1]):
-                        result["keyword"].add(word)
-
-                if row[4]:  # memory_types (JSON string like '["personal","technical"]')
+                if row[3]:  # keywords (JSON string)
                     try:
-                        types_list = json.loads(row[4])
-                        for t in types_list:
-                            for word in self._extract_words(t):
-                                result["memory_types"].add(word)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                if row[5]:  # related_ids (JSON string like '["id1","id2"]')
-                    try:
-                        ids_list = json.loads(row[5])
-                        for id_val in ids_list:
-                            for word in self._extract_words(id_val):
-                                result["related_ids"].add(word)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                if row[6]:  # related_items (JSON string like '["id1","id2","id3"]')
-                    try:
-                        items_list = json.loads(row[6])
-                        for item in items_list:
-                            for word in self._extract_words(item):
-                                result["related_items"].add(word)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                if row[7]:  # keywords (JSON string)
-                    try:
-                        kw_list = json.loads(row[7])
+                        kw_list = json.loads(row[3])
                         for kw in kw_list:
                             for word in self._extract_words(kw):
                                 result["keywords"].add(word)
@@ -738,7 +998,6 @@ class MemoryLite:
         """Generate a memory ID from a timestamp string.
         
         Format: YYMMDDhhmmss (e.g., 260506193000 for 2026-05-06 19:30:00)
-        Uses a sequence counter to handle multiple creations within the same second.
         
         Args:
             timestamp_str: ISO format timestamp string
@@ -755,48 +1014,67 @@ class MemoryLite:
             now = datetime.now(timezone.utc)
             return now.strftime("%y%m%d%H%M%S")
 
-    def _select_columns(self, include_summary: bool) -> str:
-        """Build column list for SELECT queries based on whether summary is needed."""
-        if include_summary:
-            return "id, keyword, title, summary, memory_types, related_ids, related_items, keywords, created_at, updated_at"
-        else:
-            return "id, keyword, title, memory_types, related_ids, related_items, keywords, created_at, updated_at"
+    def _select_columns_for_level(self, details_level: int) -> str:
+        """Build column list for SELECT queries based on detail level.
+        
+        Args:
+            details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full
+        """
+        if details_level == 0:
+            return "id, title, keywords"
+        elif details_level == 1:
+            return "id, title, memory_type, related_ids, keywords, created_at, updated_at"
+        else:  # details_level == 2
+            return "id, title, summary, memory_type, related_ids, keywords, created_at, updated_at"
 
-    def _row_to_dict(self, row, include_summary: bool = False) -> Optional[dict]:
+    def _safe_parse_json(self, value, default=None):
+        """Safely parse a JSON string, returning default on any error.
+        
+        Handles malformed data gracefully by catching all exceptions.
+        """
+        if value is None:
+            return default if default is not None else []
+        if isinstance(value, (list, dict)):
+            return value
+        if not isinstance(value, str):
+            return default if default is not None else []
+        try:
+            result = json.loads(value)
+            return result if result is not None else (default if default is not None else [])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return default if default is not None else []
+
+    def _row_to_dict(self, row, details_level: int = 2) -> Optional[dict]:
         """Convert a SQLite row to dictionary format.
 
         Args:
             row: SQLite row data (already fetched from database)
-            include_summary: Whether to include the summary field in the returned dict
-                               (default: False for efficiency)
+            details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full
         """
         if not row:
             return None
         
-        # Map column names from the schema based on what was selected.
-        # The column list must match _select_columns() output exactly.
-        # When include_summary=False, 'summary' is excluded so all subsequent
-        # indices shift up by one. Using the correct list prevents column misalignment.
-        if include_summary:
-            all_columns = ["id", "keyword", "title", "summary", "memory_types", 
-                           "related_ids", "related_items", "keywords", "created_at", "updated_at"]
-        else:
-            all_columns = ["id", "keyword", "title", "memory_types", 
-                           "related_ids", "related_items", "keywords", "created_at", "updated_at"]
+        # Map column names based on detail level
+        if details_level == 0:
+            all_columns = ["id", "title", "keywords"]
+        elif details_level == 1:
+            all_columns = ["id", "title", "memory_type", "related_ids", "keywords", "created_at", "updated_at"]
+        else:  # details_level == 2
+            all_columns = ["id", "title", "summary", "memory_type", "related_ids", "keywords", "created_at", "updated_at"]
         
-        # Build dict from the existing row data (no additional DB call needed)
+        # Build dict from the existing row data
         row_data = {}
         for i, col in enumerate(all_columns):
             if i < len(row):
                 row_data[col] = row[i]
 
-        # Parse JSON arrays from strings
-        for field in ["memory_types", "related_ids", "related_items", "keywords"]:
-            if isinstance(row_data.get(field, ""), str):
-                try:
-                    row_data[field] = json.loads(row_data[field])
-                except (json.JSONDecodeError, TypeError):
-                    row_data[field] = []
+        # Parse JSON arrays from strings with safe error handling
+        for field in ["related_ids", "keywords"]:
+            row_data[field] = self._safe_parse_json(row_data.get(field), [])
+
+        # Add memory type name
+        if "memory_type" in row_data:
+            row_data["memory_type_name"] = _convert_memory_type_to_name(row_data["memory_type"])
 
         return row_data
 
@@ -825,20 +1103,18 @@ def _handle_db_error(func):
 
 @mcp.tool
 def save_memory(
-    keyword: str = "",
     title: str = "",
     summary: str = "",
-    types: Opt[Union[str, list]] = '["personal"]',
+    memory_type: Opt[Union[str, int]] = 0,
     related_ids: Opt[Union[str, list]] = "[]",
-    related_items: Opt[Union[str, list]] = "[]",
     keywords: Opt[Union[str, list]] = "[]"
 ) -> str:
     """Save a memory item to the database.
 
-    IMPORTANT: The 'important_keywords' field contains SEMANTIC KEYWORDS/PHRASES useful for SEARCHING 
+    IMPORTANT: The 'keywords' field contains SEMANTIC KEYWORDS/PHRASES useful for SEARCHING 
     and MATCHING related memories. These are terms the user might remember and search by later.
     
-    WHAT TO INCLUDE in important_keywords:
+    WHAT TO INCLUDE in keywords:
       - Product names, model numbers, technical specifications
       - Key concepts, frameworks, or methodologies mentioned
       - Names of people, organizations, or locations relevant to this memory
@@ -846,7 +1122,7 @@ def save_memory(
       - Phrases that capture the essence of what this memory is about
     
     WHAT NOT TO INCLUDE:
-      - Words already covered by 'title' or 'summary (avoid simple duplication)
+      - Words already covered by 'title' or 'summary' (avoid simple duplication)
       - Generic stop words (the, a, an, for, etc.)
       - Anything too broad to be useful as a search term
     
@@ -854,35 +1130,34 @@ def save_memory(
     you'd use if you remembered this memory later but couldn't remember its title or summary.
 
     Args:
-        keyword: Unique identifier/ID for this memory item
         title: Short descriptive title (acts as 'should I read more?' indicator)
         summary: Detailed description with specific details (dates, numbers, links, names)
                  Should contain specifics that won't be obvious from reading just the title.
-        types: JSON array string of type tags (e.g., '["personal", "document"]')
-        related_ids: JSON array string of memory IDs this is related to
-        keywords: JSON array string of keywords for lookup/searching
+        memory_type: Integer type code (0-6) or type name string:
+                     0=unspecified, 1=personal, 2=document, 3=reference, 4=chat, 5=chitchat, 6=technical
+        related_ids: JSON array string or list of memory IDs this is related to
+        keywords: JSON array string or list of semantic keywords for lookup/searching
 
     Returns:
         JSON string with the saved memory data and timestamp. Includes a warning about 
-        empty important_keywords if not populated.
+        empty keywords if not populated.
     """
     try:
         mem = MemoryLite()
         mem.ensure_db_initialized()  # Ensure DB exists and is initialized
 
+        # Convert memory_type - tolerant of various input formats
+        memory_type_int = _convert_to_memory_type(memory_type)
+
         # Handle both string and already-parsed list inputs from LLMs
-        types_list = types if isinstance(types, list) else (_parse_json_list_or_fix(types) if isinstance(types, str) else None)
         related_ids_list = related_ids if isinstance(related_ids, list) else (_parse_json_list_or_fix(related_ids) if isinstance(related_ids, str) else None)
-        related_items_list = related_items if isinstance(related_items, list) else (_parse_json_list_or_fix(related_items) if isinstance(related_items, str) else None)
         keywords_list = keywords if isinstance(keywords, list) else (_parse_json_list_or_fix(keywords) if isinstance(keywords, str) else None)
 
         result = mem.save_memory(
-            keyword=keyword,
             title=title,
             summary=summary,
-            types=types_list or ["personal"],
+            memory_type=memory_type_int,
             related_ids=related_ids_list or [],
-            related_items=related_items_list or [],
             important_keywords=keywords_list or []
         )
 
@@ -894,9 +1169,11 @@ def save_memory(
 
         return json.dumps({
             "status": "success",
-            "message": f"Memory saved with keyword '{keyword}'{'' if kw_list else ''}",
+            "message": f"Memory saved: '{title}'",
             "id": result["id"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "memory_type": memory_type_int,
+            "memory_type_name": result["memory_type_name"],
             "keywords": kw_list,
             "note": warning_note or None
         }, indent=2)
@@ -905,18 +1182,19 @@ def save_memory(
 
 
 @mcp.tool
-def get_memory_by_id(memory_id: str = "") -> str:
+def get_memory_by_id(memory_id: str = "", details_level: int = 2) -> str:
     """Retrieve a specific memory by its ID.
 
     Args:
         memory_id: The unique identifier of the memory to retrieve
+        details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full (default: 2)
 
     Returns:
-        JSON string containing the memory data (without summary unless requested)
+        JSON string containing the memory data
     """
     try:
         mem = MemoryLite()
-        result = mem.get_memory_by_id(memory_id)
+        result = mem.get_memory_by_id(memory_id, details_level)
 
         if not result:
             return json.dumps({
@@ -942,11 +1220,12 @@ def get_memory_by_id(memory_id: str = "") -> str:
 
 
 @mcp.tool
-def get_memories_by_ids(memory_ids_str: str = "") -> str:
+def get_memories_by_ids(memory_ids_str: str = "", details_level: int = 1) -> str:
     """Retrieve multiple memories by their IDs.
 
     Args:
         memory_ids_str: Comma-separated string of memory IDs (e.g., "id1,id2,id3")
+        details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full (default: 1)
 
     Returns:
         JSON string containing the retrieved memories
@@ -955,7 +1234,7 @@ def get_memories_by_ids(memory_ids_str: str = "") -> str:
         mem = MemoryLite()
         ids = [x.strip() for x in memory_ids_str.split(",")] if memory_ids_str else []
         
-        results = mem.get_memories_by_ids(ids)
+        results = mem.get_memories_by_ids(ids, details_level)
 
         return json.dumps({
             "status": "success",
@@ -974,54 +1253,15 @@ def get_memories_by_ids(memory_ids_str: str = "") -> str:
 
 
 @mcp.tool
-def get_memory_by_keyword(keyword: str = "") -> str:
-    """Retrieve a specific memory by its keyword.
-
-    Args:
-        keyword: The unique identifier/ID of the memory item to retrieve
-
-    Returns:
-        JSON string containing the memory data
-    """
-    try:
-        mem = MemoryLite()
-        result = mem.get_memory_by_keyword(keyword)
-
-        if not result:
-            return json.dumps({
-                "status": "not_found",
-                "message": f"No memory found with keyword '{keyword}'",
-                "data": None
-            }, indent=2)
-
-        return json.dumps({
-            "status": "success",
-            "message": f"Memory retrieved successfully",
-            "data": result
-        }, indent=2)
-    except sqlite3.OperationalError as e:
-        if "unable to open database file" in str(e):
-            return json.dumps({
-                "status": "error",
-                "message": "Database not yet initiated. Save a memory first."
-            }, indent=2)
-        return json.dumps({"status": "error", "message": str(e)})
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-
-from typing import Union
-
-@mcp.tool
 def search(
     pattern: str = "",
-    types: Union[str, list] = None,
-    keyword: str = "",
+    memory_type: Opt[Union[str, int]] = None,
+    details_level: int = 1,
     wordJoin: str = "OR"
 ) -> str:
     """Search memories by pattern across all fields or type filter.
 
-    Searches title, summary, keyword, memory_types, and keywords in a single query.
+    Searches title, summary, and keywords in a single query.
 
     HOW THE PATTERN IS PROCESSED:
       The pattern is split by spaces - each space-separated token becomes a separate LIKE condition.
@@ -1035,21 +1275,25 @@ def search(
           Example: search(pattern="meeting about budget", wordJoin="AND")
                    → only returns memories containing "meeting AND about AND budget
 
+    MEMORY TYPE FILTER:
+      memory_type: Integer (0-6) or type name string:
+        0=unspecified, 1=personal, 2=document, 3=reference, 4=chat, 5=chitchat, 6=technical
+
     USE CASES:
-      - Use OR (default for broad discovery: find anything related to any of these terms
+      - Use OR (default) for broad discovery: find anything related to any of these terms
       - Use AND for precise filtering: require all terms appear in each result
       
     EXAMPLE WORKFLOW for deep memory exploration:
-      Step 1: search(types='["personal"]')           → All personal memories
-      Step 2: search(pattern="meeting")              → Memories about meetings  
-      Step 3: search(keyword="proj-alpha")            → Specific project memory
+      Step 1: search(memory_type=1)              → All personal memories
+      Step 2: search(pattern="meeting")          → Memories about meetings  
+      Step 3: search(memory_type=2)              → All document memories
       Step 4: search(pattern="budget", wordJoin="AND") → Budget-related with ALL words
 
     Args:
         pattern: Text to search for (each space-separated token becomes a separate LIKE condition)
-        types: JSON array string of type tags to filter by (e.g., '["personal"]')
-        keyword: Exact keyword/ID to search for
-        wordJoin: How to combine multi-word patterns - "OR" (any word matches, default or "AND" (all words must match)
+        memory_type: Integer type code (0-6) or type name string to filter by
+        details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full (default: 1)
+        wordJoin: How to combine multi-word patterns - "OR" (any word matches, default) or "AND" (all words must match)
 
     Returns:
         JSON string containing list of matched memory data. Each call returns ALL matching results - 
@@ -1058,13 +1302,13 @@ def search(
     try:
         mem = MemoryLite()
         
-        # Handle both string and already-parsed list inputs from LLMs
-        types_list = types if isinstance(types, list) else _parse_json_list_or_fix(types) if isinstance(types, str) else None
+        # Convert memory_type - tolerant of various input formats
+        memory_type_int = _convert_to_memory_type(memory_type) if memory_type is not None else None
         
         results = mem.search(
             pattern=pattern if pattern else None,
-            types=types_list,
-            keyword=keyword if keyword else None,
+            memory_type=memory_type_int,
+            details_level=details_level,
             wordJoin=wordJoin
         )
 
@@ -1085,21 +1329,23 @@ def search(
 
 
 @mcp.tool
-def get_all_memories() -> str:
-    """Get all memory items (without summary by default for efficiency).
+def get_all_memories(details_level: int = 1) -> str:
+    """Get all memory items.
+
+    Args:
+        details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full (default: 1)
 
     Returns:
-        JSON string containing list of all memories (title only, no full summaries)
+        JSON string containing list of all memories
     """
     try:
         mem = MemoryLite()
-        results = mem.get_all_memories(include_summary=False)
+        results = mem.get_all_memories(details_level)
 
         return json.dumps({
             "status": "success",
             "total_memories": len(results),
-            "memories": results,
-            "note": "Use include_summary=true with get_memory_by_id to retrieve full summaries"
+            "memories": results
         }, indent=2)
     except sqlite3.OperationalError as e:
         if "unable to open database file" in str(e):
@@ -1114,7 +1360,23 @@ def get_all_memories() -> str:
 
 @mcp.tool
 def get_all_types() -> str:
-    """Get all unique type tags used in the database with counts.
+    """Get all unique memory type codes used in the database with counts.
+
+    MEMORY TYPE CODES:
+      RESERVED TYPES (0-6):
+        0 = Unspecified — Default type when no specific category applies
+        1 = Personal — Related to the user: their life, feelings, experiences, relationships, personal goals
+        2 = Document — Summary or information extracted from a specific document provided to the LLM
+        3 = Reference — General knowledge reference: internet search results, pasted content from external sources
+        4 = Chat — General conversation without a specific topic or purpose
+        5 = Chitchat — Casual conversation, not significant, nothing new was learned
+        6 = Technical — Coding sessions, git repos, programming languages, math, science, new procedures
+
+      RESERVED RANGE (7-99): Reserved for future built-in use
+
+      USER-DEFINED RANGE (100+): Custom types defined by the user
+        100 = Custom type index — Use keywords to define your custom type meanings
+        101+ = User-defined custom types
 
     Returns:
         JSON string containing available memory types and their usage counts
@@ -1122,11 +1384,13 @@ def get_all_types() -> str:
     try:
         mem = MemoryLite()
         types_list = mem.get_all_types()
+        all_type_info = get_all_memory_type_info()
 
         return json.dumps({
             "status": "success",
-            "types": types_list,
-            "description": "Each entry shows a type tag and how many memories use it"
+            "types_in_db": types_list,
+            "all_type_codes": all_type_info,
+            "description": "types_in_db shows what's actually in the database; all_type_codes shows all available codes"
         }, indent=2)
     except sqlite3.OperationalError as e:
         if "unable to open database file" in str(e):
@@ -1144,7 +1408,7 @@ def get_all_keywords(pattern: str = "") -> str:
     """Get all keywords with optional pattern filter.
 
     Args:
-        pattern: Optional text to filter keywords by title or keyword name
+        pattern: Optional text to filter keywords by title
 
     Returns:
         JSON string containing list of all keywords and their titles
@@ -1173,20 +1437,14 @@ def get_all_keywords(pattern: str = "") -> str:
 def get_all_words(pattern: str = "") -> str:
     """Extract all words from every text field in the database.
 
-        Scans title, summary, keyword, memory_types, and keywords fields.
+    Scans title, summary, and keywords fields.
     Returns a breakdown of which words appear in which fields.
 
     Args:
         pattern: Optional string to filter results - only includes words containing this substring
 
     Returns:
-        JSON string with field-level word breakdown:
-            {
-                "title": ["word1", "word2"],
-                "summary": ["word3", "word4"],
-                "keyword": ["word5"],
-                ...
-            }
+        JSON string with field-level word breakdown
 
     NOTE: This is an EXPENSIVE operation as it must fetch all records with their full text.
           Use only when a deep word-level search is required. For most use cases, 
@@ -1284,9 +1542,9 @@ def update_memory(
     """Update an existing memory.
 
     Args:
-        memory_id: The unique identifier (UUID4 string) of the memory to update
+        memory_id: The unique identifier of the memory to update
         updates: JSON string or dict with fields to update. Example: '{"summary": "Updated summary text"}'
-                 Valid keys are: keyword, title, summary, memory_types, related_ids, related_items, keywords
+                 Valid keys are: title, summary, memory_type, related_ids, keywords
 
     Returns:
         JSON string with update result including status, message, and applied updates (with actual values)
@@ -1318,18 +1576,23 @@ def update_memory(
         else:
             update_dict = {}
 
-        # Convert string values in updates dict to proper JSON strings for json_fields
-        json_field_keys = {"memory_types", "related_ids", "related_items", "keywords"}
+        # Convert string values in updates dict to proper types
         converted_updates = {}
         for k, v in (update_dict or {}).items():
-            if k in json_field_keys and isinstance(v, str):
-                try:
-                    parsed = json.loads(v)
-                    if isinstance(parsed, list):
-                        converted_updates[k] = json.dumps(parsed)
-                    else:
+            if k == "memory_type":
+                # Convert to integer memory type
+                converted_updates[k] = _convert_to_memory_type(v)
+            elif k in ("related_ids", "keywords"):
+                if isinstance(v, str):
+                    try:
+                        parsed = json.loads(v)
+                        if isinstance(parsed, list):
+                            converted_updates[k] = json.dumps(parsed)
+                        else:
+                            converted_updates[k] = v
+                    except (json.JSONDecodeError, TypeError):
                         converted_updates[k] = v
-                except (json.JSONDecodeError, TypeError):
+                else:
                     converted_updates[k] = v
             else:
                 converted_updates[k] = v
@@ -1347,8 +1610,14 @@ def update_memory(
         if converted_updates:
             for k, v in converted_updates.items():
                 try:
-                    parsed_val = json.loads(v) if isinstance(v, str) else v
-                    updates_applied[k] = parsed_val
+                    if k in ("related_ids", "keywords") and isinstance(v, str):
+                        parsed_val = json.loads(v)
+                        updates_applied[k] = parsed_val
+                    elif k == "memory_type":
+                        updates_applied[k] = v
+                        updates_applied[k + "_name"] = _convert_memory_type_to_name(v)
+                    else:
+                        updates_applied[k] = v
                 except (json.JSONDecodeError, TypeError):
                     updates_applied[k] = v
 
@@ -1420,15 +1689,26 @@ if __name__ == "__main__":
     print("  - save_memory: Save a new memory item")
     print("  - get_memory_by_id: Retrieve specific memory by ID")
     print("  - get_memories_by_ids: Retrieve multiple memories by IDs")
-    print("  - get_memory_by_keyword: Retrieve specific memory by keyword")
     print("  - search: Search memories across all fields in single query")
-    print("  - get_all_memories: Get all stored memories (without summary)")
-    print("  - get_all_types: Show available type tags with counts")
+    print("  - get_all_memories: Get all stored memories")
+    print("  - get_all_types: Show available type codes with counts")
     print("  - get_all_keywords: List all keywords and titles")
     print("  - get_all_words: Extract all words from database with field-level breakdown (EXPENSIVE)")
     print("  - get_memory_stats: View memory statistics")
     print("  - delete_memory: Delete a memory item")
     print("  - update_memory: Update an existing memory")
+    print()
+    print("Memory Type Codes:")
+    print("  RESERVED TYPES (0-6):")
+    for code, (name, desc) in sorted(MEMORY_TYPE_MAP.items()):
+        print(f"    {code} = {name} — {desc}")
+    print(f"  RESERVED RANGE: {MEMORY_TYPE_RESERVED_START}-{MEMORY_TYPE_RESERVED_END} — Reserved for future use")
+    print(f"  USER-DEFINED RANGE: {MEMORY_TYPE_USER_DEFINED_START}+ — Custom types (define meanings via type {MEMORY_TYPE_USER_DEFINED_START} memories)")
+    print()
+    print("Details Levels:")
+    print("  0 = minimal (title + keywords only)")
+    print("  1 = excludes summary (default)")
+    print("  2 = full (includes summary)")
 
     # Run the MCP server
     mcp.run()
