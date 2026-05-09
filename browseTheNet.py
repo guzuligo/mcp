@@ -1,79 +1,899 @@
+"""
+WebReader MCP Server — Tools for web browsing and page fetching.
+
+TWO CATEGORIES OF TOOLS:
+─────────────────────────
+1. STATELESS TOOLS (one-shot, no session needed)
+   - basic_page_fetch              → Fetch page text via HTTP (fastest)
+   - fetch_page_sections           → Fetch + extract structured sections
+   - fetch_page_progressive        → Fetch sections in batches
+   - fetch_page_section_by_id      → Get one section by ID
+
+2. STATEFUL TOOLS (interactive browser session, requires session_id)
+   - browser_open                  → Open URL, returns session_id
+   - browser_navigate              → Navigate within session
+   - browser_click                 → Click element within session
+   - browser_fill                  → Fill form within session
+   - browser_get_state             → Read page content within session
+   - browser_go_back               → Go back within session
+   - browser_go_forward            → Go forward within session
+   - browser_screenshot            → Screenshot within session
+   - browser_close                 → Close session
+
+EXAMPLE WORKFLOW (stateful):
+    1. browser_open("https://example.com")
+       → {"session_id": "abc123", "title": "Example", "sections": [...]}
+    2. browser_get_state(session_id="abc123")
+       → {"sections": [...]}
+    3. browser_click(session_id="abc123", selector="#link")
+       → {"status": "success"}
+    4. browser_get_state(session_id="abc123")
+       → {"sections": [...]}  ← updated content
+    5. browser_close(session_id="abc123")
+       → {"status": "success"}
+
+EXAMPLE (stateless):
+    basic_page_fetch("https://example.com/article")
+    → Returns article text directly
+"""
+
 from fastmcp import FastMCP
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 import asyncio
 import json
 import re
+import uuid
 from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional
 
 mcp = FastMCP("WebReader")
 
+# ============================================================================
+# SESSION REGISTRY
+#
+# Stores active browser sessions keyed by session_id.
+# Each entry holds: browser, context, page, last_activity timestamp.
+# ============================================================================
 
-async def _fetch_url_content(url: str, headless: bool = True, force_playwright: bool = False) -> str:
-    """Read text from a webpage, supporting both static and JS-rendered content.
+_sessions: dict = {}
+_sessions_lock = asyncio.Lock()
+_SESSION_TIMEOUT = timedelta(minutes=10)  # Auto-cleanup after 10 min inactivity
 
-    Uses Playwright for sites with dynamic JavaScript rendering, falling back to
-    simple HTTP requests for static pages. The headless parameter controls whether
-    the browser runs in headless mode (default: True).
 
-    When force_playwright is True, skips httpx entirely and uses Playwright directly.
-    This helps with sites that return useless content via httpx but work fine with a real browser.
+async def _cleanup_expired_sessions():
+    """Remove sessions that have been idle for more than SESSION_TIMEOUT."""
+    async with _sessions_lock:
+        now = datetime.now()
+        expired = [
+            sid for sid, s in _sessions.items()
+            if now - s["last_activity"] > _SESSION_TIMEOUT
+        ]
+        for sid in expired:
+            await _destroy_session(sid, "timeout")
+
+
+async def _destroy_session(session_id: str, reason: str = ""):
+    """Close and remove a session."""
+    async with _sessions_lock:
+        session = _sessions.pop(session_id, None)
+    if session:
+        try:
+            await session["page"].close()
+        except Exception:
+            pass
+        try:
+            await session["context"].close()
+        except Exception:
+            pass
+        try:
+            await session["browser"].close()
+        except Exception:
+            pass
+
+
+def _validate_session(session_id: str) -> dict:
+    """Check that a session exists and is not expired. Returns session dict or raises."""
+    if session_id not in _sessions:
+        raise ConnectionError(
+            f"Session '{session_id}' not found or expired. "
+            f"Call browser_open(url) first to create a session."
+        )
+    session = _sessions[session_id]
+    if datetime.now() - session["last_activity"] > _SESSION_TIMEOUT:
+        asyncio.create_task(_destroy_session(session_id, "expired"))
+        raise ConnectionError(
+            f"Session '{session_id}' has expired (10 min idle). "
+            f"Call browser_open(url) to create a new session."
+        )
+    session["last_activity"] = datetime.now()
+    return session
+
+
+# ============================================================================
+# STATELESS PAGE FETCHING TOOLS
+# Each call is fully independent — no session, no persistence.
+# ============================================================================
+
+
+@mcp.tool()
+async def basic_page_fetch(url: str, force_playwright: bool = False) -> str:
+    """Fetch a webpage and return its text content as a single string.
+
+    This is a STATELESS, ONE-SHOT tool. No browser session is created or maintained.
+    Each call is completely independent — there is no navigation, no clicking,
+    and no form filling.
+
+    Use this when you just need to READ the content of a single page.
+
+    For interactive browsing (clicking links, filling forms, navigating between pages),
+    use browser_open() instead.
+
+    Args:
+        url: The URL to fetch
+        force_playwright: If True, use a real browser instead of HTTP.
+                          Use for JavaScript-heavy sites that return empty content via HTTP.
+
+    Returns:
+        Plain text content of the page (up to 5000 characters).
+
+    Example:
+        basic_page_fetch("https://example.com/article")
+        → Returns the article text
     """
     if not force_playwright:
         try:
             async with httpx.AsyncClient() as client:
-                headers = {"User-Agent": "Mozilla/5.0"}
+                headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
                 resp = await client.get(url, headers=headers, timeout=10)
-
                 if resp.status_code != 200:
                     return f"HTTP Error {resp.status_code}: {resp.text[:500]}"
 
-                text_content = resp.text
-                soup_static = BeautifulSoup(text_content, "html.parser")
-                body_text = soup_static.get_text(separator="\n", strip=True)[:5000]
-
-                if len(body_text) > 100:
-                    for element in soup_static(["script", "style", "nav", "footer"]):
-                        element.decompose()
-                    cleaned_text = soup_static.get_text(separator="\n", strip=True)[:5000]
-                    return cleaned_text
-
-        except Exception:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n", strip=True)[:5000]
+                if text:
+                    return text
+                return "No text content found on this page."
+        except Exception as e:
+            # Fall through to Playwright if HTTP fails
             pass
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+    # Force Playwright path — short-lived browser, no session
+    pw = await async_playwright().start()
+    browser = None
+    try:
+        browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1)
+            content = await page.content()
+            soup = BeautifulSoup(content, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)[:5000]
+            if text:
+                return text
+            return "No text content found on this page."
+        except Exception as e:
+            return f"Playwright error fetching {url}: {str(e)}"
+    finally:
+        if browser:
+            await browser.close()
+        await pw.stop()
+
+
+@mcp.tool()
+async def fetch_page_sections(url: str, force_playwright: bool = False) -> str:
+    """Fetch a webpage and extract its content as structured, classified sections.
+
+    This is a STATELESS, ONE-SHOT tool. No browser session is created.
+
+    Each section is classified as: main_content, secondary_content, navigation, or metadata.
+    Sections are sorted by length (most content first).
+
+    For interactive browsing, use browser_open() instead.
+
+    Args:
+        url: The URL to fetch
+        force_playwright: If True, use a real browser for JS-heavy pages.
+
+    Returns:
+        JSON with sections array and summary counts.
+
+    Example:
+        fetch_page_sections("https://example.com/article")
+        → {"sections": [...], "summary": {"main_content_count": 3, ...}}
+    """
+    pw = await async_playwright().start()
+    browser = None
+    try:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+        sections = await _extract_sections(page)
+        for s in sections:
+            s["classification"] = _classify(s)
+            s["status"] = "loaded" if s.get("length", 0) > 100 else "skipped"
+
+        result = {
+            "url": url,
+            "total_sections": len(sections),
+            "sections": sorted(sections, key=lambda x: x.get("length", 0), reverse=True),
+            "summary": {
+                "main_content_count": sum(1 for s in sections if _classify(s) == "main_content"),
+                "secondary_content_count": sum(1 for s in sections if _classify(s) == "secondary_content"),
+                "navigation_count": sum(1 for s in sections if _classify(s) == "navigation"),
+                "metadata_count": sum(1 for s in sections if _classify(s) == "metadata"),
+            }
+        }
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"url": url, "status": "error", "message": str(e)}, indent=2)
+    finally:
+        if browser:
+            await browser.close()
+        await pw.stop()
+
+
+@mcp.tool()
+async def fetch_page_progressive(
+    url: str, batch_size: int = 5, force_playwright: bool = False
+) -> str:
+    """Fetch a webpage and return content sections in progressive batches.
+
+    This is a STATELESS, ONE-SHOT tool.
+
+    Returns the first batch of main_content sections plus metadata about remaining sections.
+    Call this repeatedly to process long pages gradually.
+
+    Args:
+        url: The URL to fetch
+        batch_size: Number of sections per batch (default: 5)
+        force_playwright: If True, use a real browser.
+
+    Returns:
+        JSON with sections (this batch), total_sections, remaining_count, status.
+
+    Example:
+        fetch_page_progressive("https://long-article.com", batch_size=3)
+        → {"sections": [...], "total_sections": 12, "remaining_count": 9, "status": "in_progress"}
+    """
+    pw = await async_playwright().start()
+    browser = None
+    try:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+        all_sections = await _extract_sections(page)
+        main_sections = [s for s in all_sections if _classify(s) == "main_content"]
+        main_sections.sort(key=lambda x: x.get("length", 0), reverse=True)
+
+        batch_end = min(batch_size, max(1, len(main_sections)))
+        this_batch = main_sections[:batch_end]
+        remaining = main_sections[batch_end:]
+
+        return json.dumps({
+            "url": url,
+            "total_sections": len(main_sections),
+            "processed_count": len(this_batch),
+            "remaining_count": len(remaining),
+            "status": "complete" if not remaining else "in_progress",
+            "sections": this_batch,
+            "next_batch_available": bool(remaining),
+        }, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"url": url, "status": "error", "message": str(e)}, indent=2)
+    finally:
+        if browser:
+            await browser.close()
+        await pw.stop()
+
+
+@mcp.tool()
+async def fetch_page_section_by_id(
+    url: str, section_id: str, force_playwright: bool = False
+) -> str:
+    """Get detailed information about a specific content section by its ID.
+
+    This is a STATELESS, ONE-SHOT tool.
+
+    Args:
+        url: The URL of the page
+        section_id: The section ID (from fetch_page_sections results)
+        force_playwright: If True, use a real browser.
+
+    Returns:
+        JSON with full section data, or not_found status.
+    """
+    pw = await async_playwright().start()
+    browser = None
+    try:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+        sections = await _extract_sections(page)
+        for s in sections:
+            if s["id"] == section_id:
+                s["classification"] = _classify(s)
+                return json.dumps({
+                    "url": url,
+                    "section_id": section_id,
+                    "status": "found",
+                    "type": s.get("type"),
+                    "classification": s.get("classification"),
+                    "textContent": s.get("textContent", ""),
+                    "length": s.get("length", 0),
+                    "isInteractive": s.get("isInteractive", False),
+                }, indent=2, ensure_ascii=False)
+        return json.dumps({
+            "url": url,
+            "section_id": section_id,
+            "status": "not_found",
+            "message": f"Section '{section_id}' not found.",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "url": url,
+            "section_id": section_id,
+            "status": "error",
+            "message": str(e),
+        }, indent=2)
+    finally:
+        if browser:
+            await browser.close()
+        await pw.stop()
+
+
+# ============================================================================
+# STATEFUL BROWSING TOOLS — session-based interactive browsing
+# ============================================================================
+
+
+@mcp.tool()
+async def browser_open(url: str, headless: bool = True) -> str:
+    """Open a webpage and start an interactive browsing session.
+
+    This is the ENTRY POINT for interactive browsing. It creates a persistent browser
+    session and returns a session_id. Use that session_id with all subsequent
+    browser_* tools to interact with the page.
+
+    ⚠️ You MUST call browser_open() FIRST, then use the returned session_id
+    with browser_get_state, browser_click, browser_navigate, etc.
+
+    Args:
+        url: The URL to load
+        headless: Run browser without UI (default: True)
+
+    Returns:
+        JSON with session_id, page title, URL, and initial content sections.
+
+    Example workflow:
+        1. browser_open("https://example.com")
+           → {"session_id": "abc123", "title": "Example", "sections": [...]}
+        2. browser_get_state(session_id="abc123")
+           → {"sections": [...]}
+        3. browser_click(session_id="abc123", selector="#my-link")
+           → {"status": "success"}
+        4. browser_get_state(session_id="abc123")
+           → {"sections": [...]}  ← updated
+        5. browser_close(session_id="abc123")
+           → {"status": "success"}
+    """
+    await _cleanup_expired_sessions()
+
+    session_id = str(uuid.uuid4())[:8]
+    pw = await async_playwright().start()
+    browser = None
+    context = None
+    page = None
+    try:
+        browser = await pw.chromium.launch(headless=headless)
+        context = await browser.new_context()
+        page = await context.new_page()
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(2)
-            content = await page.content()
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            try:
+                await page.goto(url, timeout=15000)
+            except Exception:
+                pass
+        await asyncio.sleep(1)
 
-            soup = BeautifulSoup(content, "html.parser")
-            for element in soup(["script", "style", "nav", "footer"]):
-                element.decompose()
+        title = await page.title()
+        current_url = page.url
+        sections = await _extract_sections(page)
+        for s in sections:
+            s["classification"] = _classify(s)
+            s["status"] = "loaded" if s.get("length", 0) > 100 else "skipped"
 
-            text = soup.get_text(separator="\n", strip=True)[:5000]
-            if not text or len(text) < 10:
-                return "No meaningful content found on the page."
-            return text
+        # Store session
+        _sessions[session_id] = {
+            "browser": browser,
+            "context": context,
+            "page": page,
+            "last_activity": datetime.now(),
+        }
 
-        except Exception as e:
-            return f"Playwright error: {str(e)}"
+        return json.dumps({
+            "tool": "browser_open",
+            "status": "success",
+            "session_id": session_id,
+            "url": current_url,
+            "title": title,
+            "message": (
+                f"Session '{session_id}' created. "
+                f"Use this session_id with browser_get_state, browser_click, "
+                f"browser_navigate, etc. Sessions expire after 10 minutes of inactivity."
+            ),
+            "sections": sections[:10],
+            "total_sections": len(sections),
+            "next_steps": [
+                f"browser_get_state(session_id=\"{session_id}\")  — Read page content",
+                f"browser_click(session_id=\"{session_id}\", selector=\"#btn\")  — Click element",
+                f"browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
+                f"browser_close(session_id=\"{session_id}\")  — End session",
+            ],
+        }, indent=2, ensure_ascii=False)
 
-        finally:
+    except Exception as e:
+        # Clean up on failure
+        if browser:
             await browser.close()
+        return json.dumps({
+            "tool": "browser_open",
+            "status": "error",
+            "message": str(e),
+        }, indent=2)
 
 
-async def _extract_sections_from_page(page, url: str) -> list:
-    """Extract meaningful content sections from a loaded page using Playwright.
+@mcp.tool()
+async def browser_navigate(session_id: str, url: str) -> str:
+    """Navigate the session's page to a new URL.
 
-    Identifies different types of content and assigns each section a type and status.
-    Uses JavaScript to get computed text (handles dynamic content) and element metadata.
-    Related to open_page as it extracts structured data from the current browser session.
+    Uses the same browser session, so cookies and localStorage are preserved.
+
+    Args:
+        session_id: The session from browser_open()
+        url: The URL to navigate to
+
+    Returns:
+        JSON with new page title, URL, and content sections.
+
+    Example:
+        browser_navigate(session_id="abc123", url="https://example.com/about")
     """
+    try:
+        session = _validate_session(session_id)
+        page = session["page"]
+
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            try:
+                await page.goto(url, timeout=15000)
+            except Exception:
+                pass
+        await asyncio.sleep(1)
+
+        title = await page.title()
+        current_url = page.url
+        sections = await _extract_sections(page)
+        for s in sections:
+            s["classification"] = _classify(s)
+            s["status"] = "loaded" if s.get("length", 0) > 100 else "skipped"
+
+        return json.dumps({
+            "tool": "browser_navigate",
+            "status": "success",
+            "session_id": session_id,
+            "url": current_url,
+            "title": title,
+            "sections": sections[:10],
+            "total_sections": len(sections),
+            "next_steps": [
+                f"browser_get_state(session_id=\"{session_id}\")  — Read content",
+                f"browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click element",
+            ],
+        }, indent=2, ensure_ascii=False)
+
+    except ConnectionError as e:
+        return json.dumps({"tool": "browser_navigate", "status": "error", "message": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "browser_navigate",
+            "status": "error",
+            "session_id": session_id,
+            "message": str(e),
+        }, indent=2)
+
+
+@mcp.tool()
+async def browser_click(session_id: str, selector: str) -> str:
+    """Click an element on the session's page.
+
+    Args:
+        session_id: The session from browser_open()
+        selector: CSS selector (e.g., '#submit-btn', '.next-link', 'a[href="/about"]')
+
+    Returns:
+        JSON with click result. Call browser_get_state() after to see changes.
+
+    Example:
+        browser_click(session_id="abc123", selector="#main-link")
+    """
+    try:
+        session = _validate_session(session_id)
+        page = session["page"]
+        # Wait for element to be visible and interactable before clicking.
+        # This prevents timeouts when clicking hidden or obscured elements.
+        try:
+            await page.wait_for_selector(selector, state="visible", timeout=10000)
+        except Exception:
+            # If visibility wait fails, fall back to direct click (element may exist but be hidden)
+            pass
+        await page.click(selector)
+        await asyncio.sleep(1)
+
+        return json.dumps({
+            "tool": "browser_click",
+            "status": "success",
+            "session_id": session_id,
+            "selector": selector,
+            "url": page.url,
+            "title": await page.title(),
+            "message": f"Clicked '{selector}'. Call browser_get_state(session_id=\"{session_id}\") to see changes.",
+            "next_steps": [
+                f"browser_get_state(session_id=\"{session_id}\")  — Read updated content",
+                f"browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click another element",
+                f"browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
+            ],
+        }, indent=2, ensure_ascii=False)
+
+    except ConnectionError as e:
+        return json.dumps({"tool": "browser_click", "status": "error", "message": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "browser_click",
+            "status": "error",
+            "session_id": session_id,
+            "selector": selector,
+            "message": f"Failed to click '{selector}': {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def browser_fill(session_id: str, selector: str, value: str) -> str:
+    """Fill a form field on the session's page.
+
+    Args:
+        session_id: The session from browser_open()
+        selector: CSS selector for the form field (e.g., '#search-input')
+        value: Text to type into the field
+
+    Returns:
+        JSON with fill confirmation.
+
+    Example:
+        browser_fill(session_id="abc123", selector="#search-box", value="hello world")
+    """
+    try:
+        session = _validate_session(session_id)
+        page = session["page"]
+        # Wait for element to be visible and enabled before filling.
+        # This prevents timeouts when the target field hasn't rendered yet.
+        try:
+            await page.wait_for_selector(selector, state="visible", timeout=10000)
+        except Exception:
+            # If visibility wait fails, fall back to direct fill (element may exist but be hidden)
+            pass
+        await page.fill(selector, value)
+
+        return json.dumps({
+            "tool": "browser_fill",
+            "status": "success",
+            "session_id": session_id,
+            "selector": selector,
+            "value_entered": value[:100],
+            "url": page.url,
+            "title": await page.title(),
+            "message": f"Filled '{selector}'. Call browser_click to submit or browser_get_state() to see changes.",
+            "next_steps": [
+                f"browser_click(session_id=\"{session_id}\", selector=\"#submit-btn\")  — Submit form",
+                f"browser_get_state(session_id=\"{session_id}\")  — Read page content",
+            ],
+        }, indent=2, ensure_ascii=False)
+
+    except ConnectionError as e:
+        return json.dumps({"tool": "browser_fill", "status": "error", "message": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "browser_fill",
+            "status": "error",
+            "session_id": session_id,
+            "selector": selector,
+            "message": f"Failed to fill '{selector}': {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def browser_get_state(session_id: str) -> str:
+    """Get the current state of the session's page.
+
+    Extracts and classifies all content sections (main_content, secondary, navigation, metadata).
+    Use after clicking/filling/navigating to see what changed.
+
+    Args:
+        session_id: The session from browser_open()
+
+    Returns:
+        JSON with all content sections and classification counts.
+
+    Example:
+        browser_get_state(session_id="abc123")
+        → {"sections": [...], "main_content_count": 3, ...}
+    """
+    try:
+        session = _validate_session(session_id)
+        page = session["page"]
+        current_url = page.url
+        title = await page.title()
+
+        sections = await _extract_sections(page)
+        for s in sections:
+            s["classification"] = _classify(s)
+            s["status"] = "loaded" if s.get("length", 0) > 100 else "skipped"
+
+        main_c = sum(1 for s in sections if s.get("classification") == "main_content")
+        sec_c = sum(1 for s in sections if s.get("classification") == "secondary_content")
+        nav_c = sum(1 for s in sections if s.get("classification") == "navigation")
+        meta_c = sum(1 for s in sections if s.get("classification") == "metadata")
+
+        return json.dumps({
+            "tool": "browser_get_state",
+            "status": "success",
+            "session_id": session_id,
+            "url": current_url,
+            "title": title,
+            "total_sections": len(sections),
+            "main_content_count": main_c,
+            "secondary_content_count": sec_c,
+            "navigation_count": nav_c,
+            "metadata_count": meta_c,
+            "message": (
+                f"Found {main_c} main, {sec_c} secondary, {nav_c} navigation, "
+                f"{meta_c} metadata sections."
+            ),
+            "sections": sections[:20],
+            "next_steps": [
+                f"browser_click(session_id=\"{session_id}\", selector=\"#link\")  — Click element",
+                f"browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
+                f"browser_go_back(session_id=\"{session_id}\")  — Go back",
+                f"browser_screenshot(session_id=\"{session_id}\")  — Capture screenshot",
+            ],
+        }, indent=2, ensure_ascii=False)
+
+    except ConnectionError as e:
+        return json.dumps({"tool": "browser_get_state", "status": "error", "message": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "browser_get_state",
+            "status": "error",
+            "session_id": session_id,
+            "message": str(e),
+        }, indent=2)
+
+
+@mcp.tool()
+async def browser_go_back(session_id: str) -> str:
+    """Go back in the session's browser history.
+
+    Args:
+        session_id: The session from browser_open()
+
+    Returns:
+        JSON with navigation result.
+
+    Example:
+        browser_go_back(session_id="abc123")
+    """
+    try:
+        session = _validate_session(session_id)
+        page = session["page"]
+        try:
+            await page.go_back()
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+        return json.dumps({
+            "tool": "browser_go_back",
+            "status": "success",
+            "session_id": session_id,
+            "url": page.url,
+            "title": await page.title(),
+            "message": f"Navigated back. URL: {page.url}. Call browser_get_state() to read content.",
+            "next_steps": [
+                f"browser_get_state(session_id=\"{session_id}\")  — Read content",
+                f"browser_go_forward(session_id=\"{session_id}\")  — Go forward",
+            ],
+        }, indent=2, ensure_ascii=False)
+
+    except ConnectionError as e:
+        return json.dumps({"tool": "browser_go_back", "status": "error", "message": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "browser_go_back",
+            "status": "error",
+            "session_id": session_id,
+            "message": str(e),
+        }, indent=2)
+
+
+@mcp.tool()
+async def browser_go_forward(session_id: str) -> str:
+    """Go forward in the session's browser history.
+
+    Args:
+        session_id: The session from browser_open()
+
+    Returns:
+        JSON with navigation result.
+
+    Example:
+        browser_go_forward(session_id="abc123")
+    """
+    try:
+        session = _validate_session(session_id)
+        page = session["page"]
+        try:
+            await page.go_forward()
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+        return json.dumps({
+            "tool": "browser_go_forward",
+            "status": "success",
+            "session_id": session_id,
+            "url": page.url,
+            "title": await page.title(),
+            "message": f"Navigated forward. URL: {page.url}. Call browser_get_state() to read content.",
+            "next_steps": [
+                f"browser_get_state(session_id=\"{session_id}\")  — Read content",
+                f"browser_go_back(session_id=\"{session_id}\")  — Go back",
+            ],
+        }, indent=2, ensure_ascii=False)
+
+    except ConnectionError as e:
+        return json.dumps({"tool": "browser_go_forward", "status": "error", "message": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "browser_go_forward",
+            "status": "error",
+            "session_id": session_id,
+            "message": str(e),
+        }, indent=2)
+
+
+@mcp.tool()
+async def browser_screenshot(session_id: str, path: Optional[str] = None) -> str:
+    """Take a screenshot of the session's current page.
+
+    Args:
+        session_id: The session from browser_open()
+        path: Optional file path to save as PNG. If not provided, returns base64 data.
+
+    Returns:
+        JSON with screenshot data (base64) or file path.
+
+    Example:
+        browser_screenshot(session_id="abc123")
+        browser_screenshot(session_id="abc123", path="/tmp/page.png")
+    """
+    try:
+        session = _validate_session(session_id)
+        page = session["page"]
+        import base64
+        screenshot = await page.screenshot(full_page=False)
+        b64 = base64.b64encode(screenshot).decode("ascii")
+
+        result = {
+            "tool": "browser_screenshot",
+            "status": "success",
+            "session_id": session_id,
+            "url": page.url,
+            "title": await page.title(),
+            "message": "Screenshot captured.",
+            "next_steps": [
+                f"browser_get_state(session_id=\"{session_id}\")  — Read page content",
+                f"browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click element",
+            ],
+        }
+
+        if path:
+            Path(path).write_bytes(screenshot)
+            result["saved_to"] = path
+            result["message"] += f" Saved to {path}."
+        else:
+            result["screenshot_base64"] = b64[:500] + "... (truncated for context)"
+            result["message"] += " Use path= to save as file."
+
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except ConnectionError as e:
+        return json.dumps({"tool": "browser_screenshot", "status": "error", "message": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "browser_screenshot",
+            "status": "error",
+            "session_id": session_id,
+            "message": str(e),
+        }, indent=2)
+
+
+@mcp.tool()
+async def browser_close(session_id: str) -> str:
+    """Close a browsing session and free resources.
+
+    Args:
+        session_id: The session from browser_open()
+
+    Returns:
+        JSON confirming closure.
+
+    Example:
+        browser_close(session_id="abc123")
+        → {"status": "success", "message": "Session closed."}
+    """
+    try:
+        _validate_session(session_id)  # Check it exists
+        await _destroy_session(session_id, "user_closed")
+        return json.dumps({
+            "tool": "browser_close",
+            "status": "success",
+            "session_id": session_id,
+            "message": f"Session '{session_id}' closed. Call browser_open() to start a new session.",
+        }, indent=2, ensure_ascii=False)
+    except ConnectionError:
+        return json.dumps({
+            "tool": "browser_close",
+            "status": "error",
+            "session_id": session_id,
+            "message": f"Session '{session_id}' not found or already closed.",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "browser_close",
+            "status": "error",
+            "session_id": session_id,
+            "message": str(e),
+        }, indent=2)
+
+
+# ============================================================================
+# INTERNAL HELPERS
+# ============================================================================
+
+async def _extract_sections(page: Page) -> list:
+    """Extract content sections from a loaded Playwright page using JavaScript."""
     sections = await page.evaluate("""() => {
         const sections = [];
         const junkTags = ['script', 'style', 'nav', 'footer', 'header', 'aside'];
@@ -93,7 +913,13 @@ async def _extract_sections_from_page(page, url: str) -> list:
             return false;
         }
 
-        function hashCode(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); } return h; }
+        function hashCode(s) {
+            let h = 0;
+            for (let i = 0; i < s.length; i++) {
+                h = ((h << 5) - h) + s.charCodeAt(i);
+            }
+            return h;
+        }
 
         function isInteractiveElement(el) {
             const interactiveTags = ['button', 'a', 'input', 'select', 'details', 'summary'];
@@ -103,9 +929,7 @@ async def _extract_sections_from_page(page, url: str) -> list:
         }
 
         function extractTextContent(element) {
-            const walker = document.createTreeWalker(
-                element, NodeFilter.SHOW_TEXT, null
-            );
+            const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null);
             let text = '';
             while (walker.nextNode()) {
                 const t = walker.currentNode.textContent.trim();
@@ -137,595 +961,50 @@ async def _extract_sections_from_page(page, url: str) -> list:
         for (const p of paragraphs) {
             if (!isJunkElement(p)) {
                 const text = p.textContent.trim();
-                if (text.length > 50 && !sections.find(s => s.id === 'para_' + Math.abs(hashCode(text))) ) {
-                    sections.push({
-                        id: 'para_' + Math.abs(hashCode(text)),
-                        type: 'paragraph',
-                        className: p.className || '',
-                        textContent: text.substring(0, 500),
-                        length: text.length,
-                        isInteractive: false,
-                        rect: { x: 0, y: 0, width: 0, height: 0 }
-                    });
+                if (text.length > 50) {
+                    const pid = 'para_' + Math.abs(hashCode(text));
+                    if (!sections.find(s => s.id === pid)) {
+                        sections.push({
+                            id: pid,
+                            type: 'paragraph',
+                            className: p.className || '',
+                            textContent: text.substring(0, 500),
+                            length: text.length,
+                            isInteractive: false,
+                            rect: { x: 0, y: 0, width: 0, height: 0 }
+                        });
+                    }
                 }
             }
         }
         return sections;
     }""")
 
-    seen_texts = set()
-    unique_sections = []
-    for s in sorted(sections, key=lambda x: x.get('length', 0), reverse=True):
-        text_preview = s['textContent'][:100]
-        if text_preview not in seen_texts:
-            seen_texts.add(text_preview)
-            unique_sections.append(s)
+    # Deduplicate by text preview
+    seen = set()
+    unique = []
+    for s in sorted(sections, key=lambda x: x.get("length", 0), reverse=True):
+        preview = s["textContent"][:100]
+        if preview not in seen:
+            seen.add(preview)
+            unique.append(s)
+    return unique
 
-    return unique_sections
 
+def _classify(section: dict) -> str:
+    """Classify a section by its type and content."""
+    stype = section.get("type", "")
+    cls = section.get("className", "").lower()
 
-def _classify_section(section: dict) -> str:
-    """Classify a section based on its type and content. Related to open_page as it categorizes extracted page sections."""
-    stype = section.get('type', '')
-    cls = section.get('className', '').lower()
-
-    if any(x in stype for x in ['nav', 'menu']) or any(x in cls for x in ['nav', 'menu', 'sidebar', 'toc']):
+    if any(x in stype for x in ["nav", "menu"]) or any(x in cls for x in ["nav", "menu", "sidebar", "toc"]):
         return "navigation"
-    if section.get('isInteractive'):
+    if section.get("isInteractive"):
         return "interactive"
-    if section.get('length', 0) > 500:
+    if section.get("length", 0) > 500:
         return "main_content"
-    if section.get('length', 0) > 100:
+    if section.get("length", 0) > 100:
         return "secondary_content"
     return "metadata"
-
-
-async def _load_page_for_sections(url: str, headless: bool = True):
-    """Load a page and extract all content sections. Returns structured data."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        page = await browser.new_page()
-
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(2)
-            sections = await _extract_sections_from_page(page, url)
-            for s in sections:
-                s['classification'] = _classify_section(s)
-                s['status'] = 'loaded' if s.get('length', 0) > 100 else 'skipped'
-
-            return {
-                "url": url,
-                "total_sections": len(sections),
-                "sections": sections,
-                "summary": {
-                    "main_content_count": sum(1 for s in sections if s.get('classification') == 'main_content'),
-                    "secondary_content_count": sum(1 for s in sections if s.get('classification') == 'secondary_content'),
-                    "navigation_count": sum(1 for s in sections if s.get('classification') == 'navigation'),
-                    "metadata_count": sum(1 for s in sections if s.get('classification') == 'metadata'),
-                }
-            }
-        except Exception as e:
-            return {"url": url, "status": "error", "message": str(e), "sections": []}
-        finally:
-            await browser.close()
-
-
-# ============================================================================
-# HEADLESS BROWSER SESSION TOOLS (all related to open_page)
-# Each tool creates its own Playwright context and keeps it alive during execution.
-# This avoids the "browser has been closed" error from shared state being closed prematurely.
-# ============================================================================
-
-
-@mcp.tool()
-async def open_page(url: str, headless: bool = True) -> str:
-    """Open a webpage in a headless browser and return its initial content.
-
-    This is the entry point for all interactive browsing. Each call creates a fresh
-    Playwright browser instance that persists via shared state so subsequent tool calls
-    (click_element, fill_form, navigate_to, get_page_state) can interact with the same page.
-
-    Args:
-        url: The URL to load in the headless browser
-        headless: Whether to run the browser without UI (default: True)
-
-    Returns:
-        JSON with page title, URL, and initial content sections classified by type.
-        Use this to see what's on the page before interacting further.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        page = await browser.new_page()
-
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(1)
-
-            title = await page.title()
-            current_url = page.url
-
-            sections = await _extract_sections_from_page(page, url)
-            for s in sections:
-                s['classification'] = _classify_section(s)
-                s['status'] = 'loaded' if s.get('length', 0) > 100 else 'skipped'
-
-            return json.dumps({
-                "tool": "open_page",
-                "status": "success",
-                "url": current_url,
-                "title": title,
-                "message": "Page opened successfully in headless browser. Use click_element/fill_form to interact, or get_page_state to read content.",
-                "sections": sections[:10],
-                "total_sections": len(sections),
-                "next_steps": [
-                    "click_element('#button') - Click a button/link",
-                    "fill_form('#input', 'value') - Fill a form field",
-                    "get_page_state() - Read all content sections from current page",
-                    "navigate_to('new-url') - Navigate to new URL in same browser session"
-                ]
-            }, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({"tool": "open_page", "status": "error", "message": str(e)})
-
-        finally:
-            await browser.close()
-
-
-@mcp.tool()
-async def navigate_to(url: str) -> str:
-    """Navigate the existing headless browser session to a new URL.
-
-    Related to open_page - uses the same browser instance so state (cookies, localStorage) is preserved.
-    Equivalent to clicking a link or calling window.location in the browser.
-
-    Args:
-        url: The URL to navigate to within the current browser session
-
-    Returns:
-        JSON with navigation result and page metadata. Use get_page_state() afterward to read content.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(1)
-            title = await page.title()
-            current_url = page.url
-
-            return json.dumps({
-                "tool": "navigate_to",
-                "status": "success",
-                "url": current_url,
-                "title": title,
-                "message": f"Navigated to {current_url}. Use get_page_state() to read content or click_element/fill_form to interact further.",
-                "next_steps": [
-                    "get_page_state() - Read all content sections from this page",
-                    "click_element('#link') - Click a link/button on the page",
-                    "fill_form('#input', 'value') - Fill form fields"
-                ]
-            }, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({"tool": "navigate_to", "status": "error", "message": str(e)})
-
-        finally:
-            await browser.close()
-
-
-@mcp.tool()
-async def click_element(selector: str) -> str:
-    """Click an element on the current page in the headless browser session.
-
-    Related to open_page - operates on the same browser instance opened by open_page or navigate_to.
-    Use CSS selectors (e.g., '#submit-btn', '.next-page-link', 'a[href="/about"]').
-
-    Args:
-        selector: CSS selector for the element to click (button, link, div with onclick, etc.)
-
-    Returns:
-        JSON with click result and new page state. After clicking, use get_page_state() or navigate_to() to see what changed.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        try:
-            # Each tool call gets its own fresh browser, so we need shared state via URL tracking
-            # For click_element, we just perform the click and return what happened
-            await page.click(selector)
-            await asyncio.sleep(1)
-            current_url = page.url if hasattr(page, 'url') else "still on same page"
-            title = await page.title() if hasattr(page, 'title') else ""
-
-            return json.dumps({
-                "tool": "click_element",
-                "status": "success",
-                "selector": selector,
-                "new_url": current_url,
-                "title": title,
-                "message": f"Clicked element '{selector}'. Use get_page_state() to read the updated page content.",
-                "next_steps": [
-                    "get_page_state() - Read all content sections from the page after click",
-                    "click_element('#another-btn') - Click another element",
-                    "navigate_to('url') - Navigate to a new URL"
-                ]
-            }, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({
-                "tool": "click_element",
-                "status": "error",
-                "selector": selector,
-                "message": f"Failed to click element '{selector}': {str(e)}"
-            })
-
-        finally:
-            await browser.close()
-
-
-@mcp.tool()
-async def fill_form(selector: str, value: str) -> str:
-    """Fill a form field on the current page in the headless browser session.
-
-    Related to open_page - operates on the same browser instance. Use this for text inputs,
-    dropdowns, or any form element that accepts user input.
-
-    Args:
-        selector: CSS selector for the form field (e.g., '#search-input', 'input[name="email"]')
-        value: The string value to type into the field
-
-    Returns:
-        JSON with fill result and confirmation of what was entered. Follow up with click_element or get_page_state().
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        try:
-            await page.fill(selector, value)
-            current_url = page.url if hasattr(page, 'url') else ""
-            title = await page.title() if hasattr(page, 'title') else ""
-
-            return json.dumps({
-                "tool": "fill_form",
-                "status": "success",
-                "selector": selector,
-                "value_entered": value[:100],
-                "url": current_url,
-                "title": title,
-                "message": f"Filled '{selector}' with value. Use click_element to submit the form or get_page_state() to see changes.",
-                "next_steps": [
-                    "click_element('#submit-btn') - Submit a form",
-                    "get_page_state() - Read all content sections from the page",
-                    "fill_form('#another-field', 'more-text') - Fill another field"
-                ]
-            }, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({
-                "tool": "fill_form",
-                "status": "error",
-                "selector": selector,
-                "message": f"Failed to fill element '{selector}': {str(e)}"
-            })
-
-        finally:
-            await browser.close()
-
-
-@mcp.tool()
-async def get_page_state() -> str:
-    """Get the current state of the page in the headless browser session.
-
-    Related to open_page - reads content from the same browser instance. Extracts all meaningful
-    content sections and classifies them (main_content, secondary_content, navigation, metadata).
-    Use this after clicking/filling/navigating to see what changed on the page.
-
-    Returns:
-        JSON with all content sections sorted by relevance. Each section has status (loaded/skipped)
-        and classification so LLMs can decide which parts of the page are worth reading.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        try:
-            current_url = page.url
-            title = await page.title()
-            sections = await _extract_sections_from_page(page, current_url)
-            for s in sections:
-                s['classification'] = _classify_section(s)
-                s['status'] = 'loaded' if s.get('length', 0) > 100 else 'skipped'
-
-            main_content = [s for s in sections if s.get('classification') == 'main_content']
-            secondary = [s for s in sections if s.get('classification') == 'secondary_content']
-            nav = [s for s in sections if s.get('classification') == 'navigation']
-            metadata = [s for s in sections if s.get('classification') == 'metadata']
-
-            return json.dumps({
-                "tool": "get_page_state",
-                "status": "success",
-                "url": current_url,
-                "title": title,
-                "total_sections": len(sections),
-                "main_content_count": len(main_content),
-                "secondary_content_count": len(secondary),
-                "navigation_count": len(nav),
-                "metadata_count": len(metadata),
-                "message": f"Found {len(main_content)} main content sections, {len(secondary)} secondary. Each section has status (loaded/skipped) and classification.",
-                "sections": sections[:20],
-                "next_steps": [
-                    "click_element('#link') - Click to navigate or interact",
-                    "fill_form('#field', 'value') - Fill a form field",
-                    "navigate_to('new-url') - Navigate to new URL in same session"
-                ]
-            }, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({"tool": "get_page_state", "status": "error", "message": str(e)})
-
-        finally:
-            await browser.close()
-
-
-@mcp.tool()
-async def go_back() -> str:
-    """Go back in the headless browser's history.
-
-    Related to open_page - uses the same browser session's navigation stack.
-    Equivalent to clicking the browser's back button or calling window.history.back().
-
-    Returns:
-        JSON with navigation result and new page state. Use get_page_state() afterward to read content.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        try:
-            await page.go_back()
-            await asyncio.sleep(1)
-            current_url = page.url if hasattr(page, 'url') else ""
-            title = await page.title() if hasattr(page, 'title') else ""
-
-            return json.dumps({
-                "tool": "go_back",
-                "status": "success",
-                "new_url": current_url,
-                "title": title,
-                "message": f"Navigated back. Current URL: {current_url}. Use get_page_state() to read content.",
-                "next_steps": [
-                    "get_page_state() - Read all content sections from the page",
-                    "go_forward() - Go forward in history",
-                    "click_element('#link') - Click a link on this page"
-                ]
-            }, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({
-                "tool": "go_back",
-                "status": "error",
-                "message": f"go_back failed: {str(e)}"
-            })
-
-        finally:
-            await browser.close()
-
-
-@mcp.tool()
-async def go_forward() -> str:
-    """Go forward in the headless browser's history.
-
-    Related to open_page - uses the same browser session's navigation stack.
-    Equivalent to clicking the browser's forward button or calling window.history.forward().
-
-    Returns:
-        JSON with navigation result and new page state. Use get_page_state() afterward to read content.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        try:
-            await page.go_forward()
-            await asyncio.sleep(1)
-            current_url = page.url if hasattr(page, 'url') else ""
-            title = await page.title() if hasattr(page, 'title') else ""
-
-            return json.dumps({
-                "tool": "go_forward",
-                "status": "success",
-                "new_url": current_url,
-                "title": title,
-                "message": f"Navigated forward. Current URL: {current_url}. Use get_page_state() to read content.",
-                "next_steps": [
-                    "get_page_state() - Read all content sections from the page",
-                    "go_back() - Go back in history",
-                    "click_element('#link') - Click a link on this page"
-                ]
-            }, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({
-                "tool": "go_forward",
-                "status": "error",
-                "message": f"go_forward failed: {str(e)}"
-            })
-
-        finally:
-            await browser.close()
-
-
-@mcp.tool()
-async def take_screenshot(path: str = None) -> str:
-    """Take a screenshot of the current page in the headless browser session.
-
-    Related to open_page - captures the same viewport as seen by the headless browser.
-    Useful for debugging or when LLMs need visual confirmation of what's on screen.
-
-    Args:
-        path: Optional file path to save the screenshot. If not provided, returns base64-encoded PNG data.
-
-    Returns:
-        JSON with screenshot data (base64) and current page URL/title.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        try:
-            import base64
-            screenshot = await page.screenshot(full_page=False)
-            b64 = base64.b64encode(screenshot).decode('ascii')
-
-            current_url = page.url if hasattr(page, 'url') else ""
-            title = await page.title() if hasattr(page, 'title') else ""
-
-            return json.dumps({
-                "tool": "take_screenshot",
-                "status": "success",
-                "url": current_url,
-                "title": title,
-                "screenshot_base64": b64[:500] + "... (truncated for LLM context)",
-                "message": f"Screenshot captured. Use path to save as file, or read the base64 data.",
-                "next_steps": [
-                    "get_page_state() - Read all content sections from the page",
-                    "click_element('#link') - Click a link/button on the page",
-                    "navigate_to('new-url') - Navigate to new URL"
-                ]
-            }, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            return json.dumps({"tool": "take_screenshot", "status": "error", "message": str(e)})
-
-        finally:
-            await browser.close()
-
-
-@mcp.tool()
-async def close_browser_session() -> str:
-    """Close the headless browser session and free resources.
-
-    Related to open_page - this is the cleanup tool for the browser instance opened by open_page,
-    navigate_to, click_element, fill_form, etc. Call this when done with all browsing tasks.
-
-    Returns:
-        JSON confirming the browser was closed successfully. After closing, call open_page again to start a new session.
-    """
-    return json.dumps({
-        "tool": "close_browser_session",
-        "status": "success",
-        "message": "Browser session closed. All resources freed. Call open_page to start a new browsing session."
-    })
-
-
-# ============================================================================
-# ORIGINAL TOOLS (kept for backward compatibility)
-# ============================================================================
-
-@mcp.tool()
-async def fetch_page(url: str, force_playwright: bool = False) -> str:
-    """Read text from a webpage, supporting both static and JS-rendered content.
-
-    Automatically detects whether to use simple HTTP or headless browser based on
-    page complexity. For JS-heavy sites, uses Playwright with Chromium.
-
-    When force_playwright is True, skips httpx entirely and uses Playwright directly.
-    This helps with sites that return useless content via httpx but work fine with a real browser.
-    """
-    return await _fetch_url_content(url, force_playwright=force_playwright)
-
-
-@mcp.tool()
-async def fetch_page_sections(url: str, force_playwright: bool = False) -> str:
-    """Fetch a webpage and extract its content as structured sections with progress tracking.
-
-    Each section is classified by type (main_content, secondary_content, navigation, metadata)
-    and has an individual status (loaded, skipped, error). This allows LLMs to process only
-    the relevant content sections while skipping navigation, ads, etc.
-
-    Returns JSON with all extracted sections sorted by relevance (longest/most meaningful first).
-    """
-    result = await _load_page_for_sections(url)
-    return json.dumps(result, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-async def fetch_page_progressive(url: str, batch_size: int = 5, force_playwright: bool = False) -> str:
-    """Fetch a webpage and extract content sections in progressive batches.
-
-    Returns the first batch of sections along with progress metadata showing how many
-    total sections exist and what's remaining. LLMs can call this multiple times to get
-    all sections gradually, processing each batch before requesting the next.
-
-    Args:
-        url: The URL to fetch
-        batch_size: Number of sections per batch (default: 5)
-        force_playwright: If True, skip httpx and use Playwright directly
-
-    Returns JSON with:
-    - total_sections: Total number of content sections found
-    - processed_count: How many sections are in this response
-    - status: 'in_progress' or 'complete'
-    - sections: The actual section data for this batch
-    """
-    result = await _load_page_for_sections(url)
-
-    all_sections = [s for s in result.get('sections', []) if s.get('classification') == 'main_content']
-
-    all_sections.sort(key=lambda x: x.get('length', 0, reverse=True))
-
-    total = len(all_sections)
-    batch_end = min(batch_size, max(1, total))
-
-    this_batch = all_sections[:batch_end]
-    remaining = all_sections[batch_end:]
-
-    output = {
-        "url": url,
-        "total_sections": total,
-        "processed_count": len(this_batch),
-        "remaining_count": len(remaining),
-        "status": "complete" if not remaining else "in_progress",
-        "sections": this_batch,
-        "next_batch_available": bool(remaining)
-    }
-
-    return json.dumps(output, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-async def fetch_page_section_by_id(url: str, section_id: str, force_playwright: bool = False) -> str:
-    """Get detailed information about a specific content section by its ID.
-
-    Returns the full text content and metadata for the identified section.
-    Useful when LLMs want to examine one section at a time in detail.
-    """
-    result = await _load_page_for_sections(url)
-
-    for s in result.get('sections', []):
-        if s.get('id') == section_id:
-            return json.dumps({
-                "url": url,
-                "section_id": section_id,
-                "status": "found",
-                "type": s.get('type'),
-                "classification": s.get('classification'),
-                "textContent": s.get('textContent', ''),
-                "length": s.get('length', 0),
-                "isInteractive": s.get('isInteractive', False)
-            }, indent=2, ensure_ascii=False)
-
-    return json.dumps({
-        "url": url,
-        "section_id": section_id,
-        "status": "not_found",
-        "message": f"Section '{section_id}' not found in the page."
-    })
 
 
 if __name__ == "__main__":
