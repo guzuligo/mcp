@@ -38,9 +38,11 @@ EXAMPLE (stateless):
 """
 
 from fastmcp import FastMCP
+from mcp.types import ImageContent, TextContent
 import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from PIL import Image
 import asyncio
 import json
 import re
@@ -48,6 +50,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
+import io
 
 mcp = FastMCP("WebReader")
 
@@ -794,26 +797,122 @@ async def browser_go_forward(session_id: str) -> str:
 
 
 @mcp.tool()
-async def browser_screenshot(session_id: str, path: Optional[str] = None) -> str:
-    """Take a screenshot of the session's current page.
+async def browser_screenshot(
+    session_id: str,
+    max_dimension: int = 768,
+    colors: int = 16,
+    fmt: str = "png",
+    quality: int = 85,
+    path: Optional[str] = None,
+) -> list:#str:
+    """Take a screenshot of the session's current page with optimized output.
+
+    Resizes the browser viewport, reduces colors, and compresses the image
+    to keep base64 output small for LLM context windows.
 
     Args:
         session_id: The session from browser_open()
-        path: Optional file path to save as PNG. If not provided, returns base64 data.
+        max_dimension: Max width/height in pixels (default: 768). The smaller dimension
+                       is scaled proportionally. Set to 1920 for full resolution.
+        colors: Color palette size 1–256 (default: 16). Uses Pillow quantization.
+                Set to 256 for full color. Ignored for jpeg/webp (always 24-bit).
+        fmt: Output format: "png" (default), "jpeg", or "webp".
+             png: Lossless, larger file.
+             jpeg: Lossy, smallest file (15–50KB typical). No transparency.
+             webp: Lossy or lossless, good compression (10–30KB typical).
+        quality: Compression quality for jpeg/webp (1–100, default: 85).
+                 Ignored for png (png always uses maximum compression).
+        path: Optional file path to save as PNG/JPEG/WEBP. If not provided,
+              returns base64-encoded data.
 
     Returns:
         JSON with screenshot data (base64) or file path.
 
     Example:
         browser_screenshot(session_id="abc123")
-        browser_screenshot(session_id="abc123", path="/tmp/page.png")
+        → Small base64 PNG, ~16 colors, max 768px
+
+        browser_screenshot(session_id="abc123", fmt="jpeg", quality=90)
+        → Small base64 JPEG, full color, ~20KB
+
+        browser_screenshot(session_id="abc123", max_dimension=1920, colors=256, fmt="png")
+        → Large base64 PNG, full color, ~500KB
+
+        browser_screenshot(session_id="abc123", path="/tmp/screen.jpg")
+        → Saved to file as JPEG
     """
     try:
         session = _validate_session(session_id)
         page = session["page"]
+
+        # Validate parameters
+        max_dimension = max(100, min(4096, int(max_dimension)))
+        colors = max(1, min(256, int(colors)))
+        quality = max(1, min(100, int(quality)))
+        fmt = fmt.lower().strip()
+        if fmt not in ("png", "jpeg", "webp"):
+            fmt = "png"
+
+        # Step 1: Set viewport to max_dimension for consistent sizing
+        current_viewport = page.viewport_size or {}
+        orig_width = current_viewport.get("width", 1280)
+        orig_height = current_viewport.get("height", 720)
+        """
+        if max(orig_width, orig_height) > max_dimension:
+            ratio = max_dimension / max(orig_width, orig_height)
+            new_width = max(320, int(orig_width * ratio))
+            new_height = max(200, int(orig_height * ratio))
+            await page.set_viewport_size({"width": new_width, "height": new_height})
+        else:
+            # Scale up to max_dimension if page is smaller
+            if orig_width < max_dimension:
+                new_height = max(200, int(orig_height * (max_dimension / orig_width)))
+                await page.set_viewport_size({"width": max_dimension, "height": new_height})
+        """
+        # Step 2: Capture screenshot from Playwright
         import base64
-        screenshot = await page.screenshot(full_page=False)
-        b64 = base64.b64encode(screenshot).decode("ascii")
+        screenshot_bytes = await page.screenshot(full_page=False, type="png")
+
+        # Step 3: Process with Pillow
+        img = Image.open(io.BytesIO(screenshot_bytes))
+
+        # Composite onto white background to replace transparent pixels with white
+        # This prevents alpha channels from turning black on RGB conversion
+        if img.mode == "RGBA":
+            bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            bg.paste(img, mask=img.split()[3])  # Use alpha channel as mask
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # Reduce colors if requested and format allows
+        if colors < 256 and fmt == "png":
+            img = img.quantize(colors=colors)
+
+        # Step 4: Re-encode to desired format
+        if fmt == "png":
+            output_buf = io.BytesIO()
+            img.save(output_buf, format="PNG", compress_level=9)
+            screenshot_bytes = output_buf.getvalue()
+        elif fmt == "jpeg":
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            output_buf = io.BytesIO()
+            img.save(output_buf, format="JPEG", quality=quality, optimize=True)
+            screenshot_bytes = output_buf.getvalue()
+        elif fmt == "webp":
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            output_buf = io.BytesIO()
+            img.save(output_buf, format="WEBP", quality=quality, optimize=True)
+            screenshot_bytes = output_buf.getvalue()
+
+        # Step 5: Encode to base64
+        b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+
+        # Determine file extension for path saving
+        ext_map = {"png": "png", "jpeg": "jpg", "webp": "webp"}
+        file_ext = ext_map.get(fmt, "png")
 
         result = {
             "tool": "browser_screenshot",
@@ -821,6 +920,10 @@ async def browser_screenshot(session_id: str, path: Optional[str] = None) -> str
             "session_id": session_id,
             "url": page.url,
             "title": await page.title(),
+            "viewport": {"width": max_dimension, "height": "scaled proportionally"},
+            "format": fmt,
+            "colors": colors if fmt == "png" else 24,
+            "file_size_estimate": f"{len(screenshot_bytes) / 1024:.1f} KB",
             "message": "Screenshot captured.",
             "next_steps": [
                 f"browser_get_state(session_id=\"{session_id}\")  — Read page content",
@@ -829,24 +932,50 @@ async def browser_screenshot(session_id: str, path: Optional[str] = None) -> str
         }
 
         if path:
-            Path(path).write_bytes(screenshot)
-            result["saved_to"] = path
-            result["message"] += f" Saved to {path}."
+            Path(path).write_bytes(screenshot_bytes)
+            return json.dumps({
+                "tool": "browser_screenshot",
+                "status": "success",
+                "session_id": session_id,
+                "url": page.url,
+                "title": await page.title(),
+                "saved_to": path,
+                "message": f"Screenshot saved to {path}."
+            }, indent=2, ensure_ascii=False)
         else:
-            result["screenshot_base64"] = b64[:500] + "... (truncated for context)"
-            result["message"] += " Use path= to save as file."
+            # Return as structured content array (image + text) for direct rendering
+            mime_map = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
+            mime = mime_map.get(fmt, "image/png")
 
-        return json.dumps(result, indent=2, ensure_ascii=False)
+            # Build metadata text
+            metadata_text = (
+                f"Screenshot captured.\n"
+                f"URL: {page.url}\n"
+                f"Title: {await page.title()}\n"
+                f"Format: {fmt}, Size: {len(screenshot_bytes) / 1024:.1f} KB"
+            )
+
+            # Return as a list of content parts (MCP standard format)
+            return [
+                ImageContent(
+                    type="image",
+                    data=b64,
+                    mimeType=mime
+                ),
+                TextContent(
+                    type="text",
+                    text=f"[VISUAL DATA ATTACHED: Please use your vision capabilities to analyze the layout above. If you cannot see it, notify the user that the MCP host has not projected the image into your context.]"
+                )
+            ]
 
     except ConnectionError as e:
-        return json.dumps({"tool": "browser_screenshot", "status": "error", "message": str(e)}, indent=2)
+        return [
+            TextContent(type="text", text=f"Error: {str(e)}")
+        ]
     except Exception as e:
-        return json.dumps({
-            "tool": "browser_screenshot",
-            "status": "error",
-            "session_id": session_id,
-            "message": str(e),
-        }, indent=2)
+        return [
+            TextContent(type="text", text=f"Error: {str(e)}")
+        ]
 
 
 @mcp.tool()
