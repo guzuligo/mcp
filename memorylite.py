@@ -1102,7 +1102,7 @@ def _handle_db_error(func):
     return wrapper
 
 @mcp.tool
-def save_memory(
+def memorylite_save_memory(
     title: str = "",
     summary: str = "",
     memory_type: Opt[Union[str, int]] = 0,
@@ -1182,7 +1182,7 @@ def save_memory(
 
 
 @mcp.tool
-def get_memory_by_id(memory_id: str = "", details_level: int = 2) -> str:
+def memorylite_get_memory_by_id(memory_id: str = "", details_level: int = 2) -> str:
     """Retrieve a specific memory by its ID.
 
     Args:
@@ -1220,7 +1220,7 @@ def get_memory_by_id(memory_id: str = "", details_level: int = 2) -> str:
 
 
 @mcp.tool
-def get_memories_by_ids(memory_ids_str: str = "", details_level: int = 1) -> str:
+def memorylite_get_memories_by_ids(memory_ids_str: str = "", details_level: int = 1) -> str:
     """Retrieve multiple memories by their IDs.
 
     Args:
@@ -1253,7 +1253,7 @@ def get_memories_by_ids(memory_ids_str: str = "", details_level: int = 1) -> str
 
 
 @mcp.tool
-def search(
+def memorylite_search(
     pattern: str = "",
     memory_type: Opt[Union[str, int]] = None,
     details_level: int = 1,
@@ -1329,7 +1329,7 @@ def search(
 
 
 @mcp.tool
-def get_all_memories(details_level: int = 1) -> str:
+def memorylite_get_all_memories(details_level: int = 1) -> str:
     """Get all memory items.
 
     Args:
@@ -1359,7 +1359,7 @@ def get_all_memories(details_level: int = 1) -> str:
 
 
 @mcp.tool
-def get_all_types() -> str:
+def memorylite_get_all_types() -> str:
     """Get all unique memory type codes used in the database with counts.
 
     MEMORY TYPE CODES:
@@ -1404,7 +1404,7 @@ def get_all_types() -> str:
 
 
 @mcp.tool
-def get_all_keywords(pattern: str = "") -> str:
+def memorylite_get_all_keywords(pattern: str = "") -> str:
     """Get all keywords with optional pattern filter.
 
     Args:
@@ -1434,7 +1434,7 @@ def get_all_keywords(pattern: str = "") -> str:
 
 
 @mcp.tool
-def get_all_words(pattern: str = "") -> str:
+def memorylite_get_all_words(pattern: str = "") -> str:
     """Extract all words from every text field in the database.
 
     Scans title, summary, and keywords fields.
@@ -1480,7 +1480,7 @@ def get_all_words(pattern: str = "") -> str:
 
 
 @mcp.tool
-def get_memory_stats() -> str:
+def memorylite_get_memory_stats() -> str:
     """Get statistics about the memory database.
 
     Returns:
@@ -1506,7 +1506,7 @@ def get_memory_stats() -> str:
 
 
 @mcp.tool
-def delete_memory(memory_id: str = "") -> str:
+def memorylite_delete_memory(memory_id: str = "") -> str:
     """Delete a specific memory by ID.
 
     Args:
@@ -1535,7 +1535,7 @@ def delete_memory(memory_id: str = "") -> str:
 
 
 @mcp.tool
-def update_memory(
+def memorylite_update_memory(
     memory_id: str = "",
     updates: Union[str, dict] = "{}"
 ) -> str:
@@ -1686,17 +1686,17 @@ if __name__ == "__main__":
     print("=" * 50)
     print("This module provides memory management via FastMCP tools.")
     print("Available tools:")
-    print("  - save_memory: Save a new memory item")
-    print("  - get_memory_by_id: Retrieve specific memory by ID")
-    print("  - get_memories_by_ids: Retrieve multiple memories by IDs")
-    print("  - search: Search memories across all fields in single query")
-    print("  - get_all_memories: Get all stored memories")
-    print("  - get_all_types: Show available type codes with counts")
-    print("  - get_all_keywords: List all keywords and titles")
-    print("  - get_all_words: Extract all words from database with field-level breakdown (EXPENSIVE)")
-    print("  - get_memory_stats: View memory statistics")
-    print("  - delete_memory: Delete a memory item")
-    print("  - update_memory: Update an existing memory")
+    print("  - memorylite_save_memory: Save a new memory item")
+    print("  - memorylite_get_memory_by_id: Retrieve specific memory by ID")
+    print("  - memorylite_get_memories_by_ids: Retrieve multiple memories by IDs")
+    print("  - memorylite_search: Search memories across all fields in single query")
+    print("  - memorylite_get_all_memories: Get all stored memories")
+    print("  - memorylite_get_all_types: Show available type codes with counts")
+    print("  - memorylite_get_all_keywords: List all keywords and titles")
+    print("  - memorylite_get_all_words: Extract all words from database with field-level breakdown (EXPENSIVE)")
+    print("  - memorylite_get_memory_stats: View memory statistics")
+    print("  - memorylite_delete_memory: Delete a memory item")
+    print("  - memorylite_update_memory: Update an existing memory")
     print()
     print("Memory Type Codes:")
     print("  RESERVED TYPES (0-6):")

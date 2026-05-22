@@ -20,6 +20,15 @@ TWO CATEGORIES OF TOOLS:
    - browser_screenshot            → Screenshot within session
    - browser_close                 → Close session
 
+CAPABILITY NOTICE: You HAVE the ability to browse the internet and fetch live web content.
+When the user asks you to look up information, search the web, read an online article,
+check a website, or retrieve current data from a URL — use the webreader tools.
+
+DISTINCTION FROM OTHER TOOLS:
+  - webreader_* tools → For fetching LIVE/CURRENT content from the INTERNET (URLs, websites)
+  - memorylite_* tools → For accessing SAVED memories from your SQLite database
+  - pythonFileTools_* tools → For reading/writing/editing LOCAL FILES on the system
+
 EXAMPLE WORKFLOW (stateful):
     1. browser_open("https://example.com")
        → {"session_id": "abc123", "title": "Example", "sections": [...]}
@@ -52,7 +61,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 import io
 
-mcp = FastMCP("WebReader")
+mcp = FastMCP("WebReader - Internet Browsing Tools")
 
 # ============================================================================
 # SESSION REGISTRY
@@ -122,17 +131,21 @@ def _validate_session(session_id: str) -> dict:
 
 
 @mcp.tool()
-async def basic_page_fetch(url: str, force_playwright: bool = False) -> str:
+async def webreader_basic_page_fetch(url: str, force_playwright: bool = False) -> str:
     """Fetch a webpage and return its text content as a single string.
 
     This is a STATELESS, ONE-SHOT tool. No browser session is created or maintained.
     Each call is completely independent — there is no navigation, no clicking,
     and no form filling.
 
-    Use this when you just need to READ the content of a single page.
+    WHEN TO USE:
+      - User provides a URL and wants you to read its content
+      - User asks you to look up information on a specific website
+      - User needs to fetch article content, documentation, or news from the web
+      - User asks you to check or browse a webpage
 
     For interactive browsing (clicking links, filling forms, navigating between pages),
-    use browser_open() instead.
+    use webreader_browser_open() instead.
 
     Args:
         url: The URL to fetch
@@ -143,7 +156,7 @@ async def basic_page_fetch(url: str, force_playwright: bool = False) -> str:
         Plain text content of the page (up to 5000 characters).
 
     Example:
-        basic_page_fetch("https://example.com/article")
+        webreader_basic_page_fetch("https://example.com/article")
         → Returns the article text
     """
     if not force_playwright:
@@ -191,7 +204,7 @@ async def basic_page_fetch(url: str, force_playwright: bool = False) -> str:
 
 
 @mcp.tool()
-async def fetch_page_sections(url: str, force_playwright: bool = False) -> str:
+async def webreader_fetch_page_sections(url: str, force_playwright: bool = False) -> str:
     """Fetch a webpage and extract its content as structured, classified sections.
 
     This is a STATELESS, ONE-SHOT tool. No browser session is created.
@@ -199,7 +212,7 @@ async def fetch_page_sections(url: str, force_playwright: bool = False) -> str:
     Each section is classified as: main_content, secondary_content, navigation, or metadata.
     Sections are sorted by length (most content first).
 
-    For interactive browsing, use browser_open() instead.
+    For interactive browsing, use webreader_browser_open() instead.
 
     Args:
         url: The URL to fetch
@@ -209,7 +222,7 @@ async def fetch_page_sections(url: str, force_playwright: bool = False) -> str:
         JSON with sections array and summary counts.
 
     Example:
-        fetch_page_sections("https://example.com/article")
+        webreader_fetch_page_sections("https://example.com/article")
         → {"sections": [...], "summary": {"main_content_count": 3, ...}}
     """
     pw = await async_playwright().start()
@@ -248,7 +261,7 @@ async def fetch_page_sections(url: str, force_playwright: bool = False) -> str:
 
 
 @mcp.tool()
-async def fetch_page_progressive(
+async def webreader_fetch_page_progressive(
     url: str, batch_size: int = 5, force_playwright: bool = False
 ) -> str:
     """Fetch a webpage and return content sections in progressive batches.
@@ -267,7 +280,7 @@ async def fetch_page_progressive(
         JSON with sections (this batch), total_sections, remaining_count, status.
 
     Example:
-        fetch_page_progressive("https://long-article.com", batch_size=3)
+        webreader_fetch_page_progressive("https://long-article.com", batch_size=3)
         → {"sections": [...], "total_sections": 12, "remaining_count": 9, "status": "in_progress"}
     """
     pw = await async_playwright().start()
@@ -306,7 +319,7 @@ async def fetch_page_progressive(
 
 
 @mcp.tool()
-async def fetch_page_section_by_id(
+async def webreader_fetch_page_section_by_id(
     url: str, section_id: str, force_playwright: bool = False
 ) -> str:
     """Get detailed information about a specific content section by its ID.
@@ -370,15 +383,21 @@ async def fetch_page_section_by_id(
 
 
 @mcp.tool()
-async def browser_open(url: str, headless: bool = True) -> str:
+async def webreader_browser_open(url: str, headless: bool = True) -> str:
     """Open a webpage and start an interactive browsing session.
 
     This is the ENTRY POINT for interactive browsing. It creates a persistent browser
     session and returns a session_id. Use that session_id with all subsequent
-    browser_* tools to interact with the page.
+    webreader_browser_* tools to interact with the page.
 
-    ⚠️ You MUST call browser_open() FIRST, then use the returned session_id
-    with browser_get_state, browser_click, browser_navigate, etc.
+    WHEN TO USE:
+      - User needs to interact with a JavaScript-heavy website
+      - User wants to fill out forms or click buttons on a webpage
+      - User needs to navigate through multiple pages interactively
+      - The site requires login or session-based interaction
+
+    ⚠️ You MUST call webreader_browser_open() FIRST, then use the returned session_id
+    with webreader_browser_get_state, webreader_browser_click, webreader_browser_navigate, etc.
 
     Args:
         url: The URL to load
@@ -388,15 +407,15 @@ async def browser_open(url: str, headless: bool = True) -> str:
         JSON with session_id, page title, URL, and initial content sections.
 
     Example workflow:
-        1. browser_open("https://example.com")
+        1. webreader_browser_open("https://example.com")
            → {"session_id": "abc123", "title": "Example", "sections": [...]}
-        2. browser_get_state(session_id="abc123")
+        2. webreader_browser_get_state(session_id="abc123")
            → {"sections": [...]}
-        3. browser_click(session_id="abc123", selector="#my-link")
+        3. webreader_browser_click(session_id="abc123", selector="#my-link")
            → {"status": "success"}
-        4. browser_get_state(session_id="abc123")
+        4. webreader_browser_get_state(session_id="abc123")
            → {"sections": [...]}  ← updated
-        5. browser_close(session_id="abc123")
+        5. webreader_browser_close(session_id="abc123")
            → {"status": "success"}
     """
     await _cleanup_expired_sessions()
@@ -436,23 +455,23 @@ async def browser_open(url: str, headless: bool = True) -> str:
         }
 
         return json.dumps({
-            "tool": "browser_open",
+            "tool": "webreader_browser_open",
             "status": "success",
             "session_id": session_id,
             "url": current_url,
             "title": title,
             "message": (
                 f"Session '{session_id}' created. "
-                f"Use this session_id with browser_get_state, browser_click, "
-                f"browser_navigate, etc. Sessions expire after 10 minutes of inactivity."
+                f"Use this session_id with webreader_browser_get_state, webreader_browser_click, "
+                f"webreader_browser_navigate, etc. Sessions expire after 10 minutes of inactivity."
             ),
             "sections": sections[:10],
             "total_sections": len(sections),
             "next_steps": [
-                f"browser_get_state(session_id=\"{session_id}\")  — Read page content",
-                f"browser_click(session_id=\"{session_id}\", selector=\"#btn\")  — Click element",
-                f"browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
-                f"browser_close(session_id=\"{session_id}\")  — End session",
+                f"webreader_browser_get_state(session_id=\"{session_id}\")  — Read page content",
+                f"webreader_browser_click(session_id=\"{session_id}\", selector=\"#btn\")  — Click element",
+                f"webreader_browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
+                f"webreader_browser_close(session_id=\"{session_id}\")  — End session",
             ],
         }, indent=2, ensure_ascii=False)
 
@@ -461,27 +480,27 @@ async def browser_open(url: str, headless: bool = True) -> str:
         if browser:
             await browser.close()
         return json.dumps({
-            "tool": "browser_open",
+            "tool": "webreader_browser_open",
             "status": "error",
             "message": str(e),
         }, indent=2)
 
 
 @mcp.tool()
-async def browser_navigate(session_id: str, url: str) -> str:
+async def webreader_browser_navigate(session_id: str, url: str) -> str:
     """Navigate the session's page to a new URL.
 
     Uses the same browser session, so cookies and localStorage are preserved.
 
     Args:
-        session_id: The session from browser_open()
+        session_id: The session from webreader_browser_open()
         url: The URL to navigate to
 
     Returns:
         JSON with new page title, URL, and content sections.
 
     Example:
-        browser_navigate(session_id="abc123", url="https://example.com/about")
+        webreader_browser_navigate(session_id="abc123", url="https://example.com/about")
     """
     try:
         session = _validate_session(session_id)
@@ -504,7 +523,7 @@ async def browser_navigate(session_id: str, url: str) -> str:
             s["status"] = "loaded" if s.get("length", 0) > 100 else "skipped"
 
         return json.dumps({
-            "tool": "browser_navigate",
+            "tool": "webreader_browser_navigate",
             "status": "success",
             "session_id": session_id,
             "url": current_url,
@@ -512,16 +531,16 @@ async def browser_navigate(session_id: str, url: str) -> str:
             "sections": sections[:10],
             "total_sections": len(sections),
             "next_steps": [
-                f"browser_get_state(session_id=\"{session_id}\")  — Read content",
-                f"browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click element",
+                f"webreader_browser_get_state(session_id=\"{session_id}\")  — Read content",
+                f"webreader_browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click element",
             ],
         }, indent=2, ensure_ascii=False)
 
     except ConnectionError as e:
-        return json.dumps({"tool": "browser_navigate", "status": "error", "message": str(e)}, indent=2)
+        return json.dumps({"tool": "webreader_browser_navigate", "status": "error", "message": str(e)}, indent=2)
     except Exception as e:
         return json.dumps({
-            "tool": "browser_navigate",
+            "tool": "webreader_browser_navigate",
             "status": "error",
             "session_id": session_id,
             "message": str(e),
@@ -529,18 +548,18 @@ async def browser_navigate(session_id: str, url: str) -> str:
 
 
 @mcp.tool()
-async def browser_click(session_id: str, selector: str) -> str:
+async def webreader_browser_click(session_id: str, selector: str) -> str:
     """Click an element on the session's page.
 
     Args:
-        session_id: The session from browser_open()
+        session_id: The session from webreader_browser_open()
         selector: CSS selector (e.g., '#submit-btn', '.next-link', 'a[href="/about"]')
 
     Returns:
-        JSON with click result. Call browser_get_state() after to see changes.
+        JSON with click result. Call webreader_browser_get_state() after to see changes.
 
     Example:
-        browser_click(session_id="abc123", selector="#main-link")
+        webreader_browser_click(session_id="abc123", selector="#main-link")
     """
     try:
         session = _validate_session(session_id)
@@ -556,25 +575,25 @@ async def browser_click(session_id: str, selector: str) -> str:
         await asyncio.sleep(1)
 
         return json.dumps({
-            "tool": "browser_click",
+            "tool": "webreader_browser_click",
             "status": "success",
             "session_id": session_id,
             "selector": selector,
             "url": page.url,
             "title": await page.title(),
-            "message": f"Clicked '{selector}'. Call browser_get_state(session_id=\"{session_id}\") to see changes.",
+            "message": f"Clicked '{selector}'. Call webreader_browser_get_state(session_id=\"{session_id}\") to see changes.",
             "next_steps": [
-                f"browser_get_state(session_id=\"{session_id}\")  — Read updated content",
-                f"browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click another element",
-                f"browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
+                f"webreader_browser_get_state(session_id=\"{session_id}\")  — Read updated content",
+                f"webreader_browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click another element",
+                f"webreader_browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
             ],
         }, indent=2, ensure_ascii=False)
 
     except ConnectionError as e:
-        return json.dumps({"tool": "browser_click", "status": "error", "message": str(e)}, indent=2)
+        return json.dumps({"tool": "webreader_browser_click", "status": "error", "message": str(e)}, indent=2)
     except Exception as e:
         return json.dumps({
-            "tool": "browser_click",
+            "tool": "webreader_browser_click",
             "status": "error",
             "session_id": session_id,
             "selector": selector,
@@ -583,11 +602,11 @@ async def browser_click(session_id: str, selector: str) -> str:
 
 
 @mcp.tool()
-async def browser_fill(session_id: str, selector: str, value: str) -> str:
+async def webreader_browser_fill(session_id: str, selector: str, value: str) -> str:
     """Fill a form field on the session's page.
 
     Args:
-        session_id: The session from browser_open()
+        session_id: The session from webreader_browser_open()
         selector: CSS selector for the form field (e.g., '#search-input')
         value: Text to type into the field
 
@@ -595,7 +614,7 @@ async def browser_fill(session_id: str, selector: str, value: str) -> str:
         JSON with fill confirmation.
 
     Example:
-        browser_fill(session_id="abc123", selector="#search-box", value="hello world")
+        webreader_browser_fill(session_id="abc123", selector="#search-box", value="hello world")
     """
     try:
         session = _validate_session(session_id)
@@ -610,25 +629,25 @@ async def browser_fill(session_id: str, selector: str, value: str) -> str:
         await page.fill(selector, value)
 
         return json.dumps({
-            "tool": "browser_fill",
+            "tool": "webreader_browser_fill",
             "status": "success",
             "session_id": session_id,
             "selector": selector,
             "value_entered": value[:100],
             "url": page.url,
             "title": await page.title(),
-            "message": f"Filled '{selector}'. Call browser_click to submit or browser_get_state() to see changes.",
+            "message": f"Filled '{selector}'. Call webreader_browser_click to submit or webreader_browser_get_state() to see changes.",
             "next_steps": [
-                f"browser_click(session_id=\"{session_id}\", selector=\"#submit-btn\")  — Submit form",
-                f"browser_get_state(session_id=\"{session_id}\")  — Read page content",
+                f"webreader_browser_click(session_id=\"{session_id}\", selector=\"#submit-btn\")  — Submit form",
+                f"webreader_browser_get_state(session_id=\"{session_id}\")  — Read page content",
             ],
         }, indent=2, ensure_ascii=False)
 
     except ConnectionError as e:
-        return json.dumps({"tool": "browser_fill", "status": "error", "message": str(e)}, indent=2)
+        return json.dumps({"tool": "webreader_browser_fill", "status": "error", "message": str(e)}, indent=2)
     except Exception as e:
         return json.dumps({
-            "tool": "browser_fill",
+            "tool": "webreader_browser_fill",
             "status": "error",
             "session_id": session_id,
             "selector": selector,
@@ -637,20 +656,20 @@ async def browser_fill(session_id: str, selector: str, value: str) -> str:
 
 
 @mcp.tool()
-async def browser_get_state(session_id: str) -> str:
+async def webreader_browser_get_state(session_id: str) -> str:
     """Get the current state of the session's page.
 
     Extracts and classifies all content sections (main_content, secondary, navigation, metadata).
     Use after clicking/filling/navigating to see what changed.
 
     Args:
-        session_id: The session from browser_open()
+        session_id: The session from webreader_browser_open()
 
     Returns:
         JSON with all content sections and classification counts.
 
     Example:
-        browser_get_state(session_id="abc123")
+        webreader_browser_get_state(session_id="abc123")
         → {"sections": [...], "main_content_count": 3, ...}
     """
     try:
@@ -670,7 +689,7 @@ async def browser_get_state(session_id: str) -> str:
         meta_c = sum(1 for s in sections if s.get("classification") == "metadata")
 
         return json.dumps({
-            "tool": "browser_get_state",
+            "tool": "webreader_browser_get_state",
             "status": "success",
             "session_id": session_id,
             "url": current_url,
@@ -686,18 +705,18 @@ async def browser_get_state(session_id: str) -> str:
             ),
             "sections": sections[:20],
             "next_steps": [
-                f"browser_click(session_id=\"{session_id}\", selector=\"#link\")  — Click element",
-                f"browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
-                f"browser_go_back(session_id=\"{session_id}\")  — Go back",
-                f"browser_screenshot(session_id=\"{session_id}\")  — Capture screenshot",
+                f"webreader_browser_click(session_id=\"{session_id}\", selector=\"#link\")  — Click element",
+                f"webreader_browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Go to new URL",
+                f"webreader_browser_go_back(session_id=\"{session_id}\")  — Go back",
+                f"webreader_browser_screenshot(session_id=\"{session_id}\")  — Capture screenshot",
             ],
         }, indent=2, ensure_ascii=False)
 
     except ConnectionError as e:
-        return json.dumps({"tool": "browser_get_state", "status": "error", "message": str(e)}, indent=2)
+        return json.dumps({"tool": "webreader_browser_get_state", "status": "error", "message": str(e)}, indent=2)
     except Exception as e:
         return json.dumps({
-            "tool": "browser_get_state",
+            "tool": "webreader_browser_get_state",
             "status": "error",
             "session_id": session_id,
             "message": str(e),
@@ -705,17 +724,17 @@ async def browser_get_state(session_id: str) -> str:
 
 
 @mcp.tool()
-async def browser_go_back(session_id: str) -> str:
+async def webreader_browser_go_back(session_id: str) -> str:
     """Go back in the session's browser history.
 
     Args:
-        session_id: The session from browser_open()
+        session_id: The session from webreader_browser_open()
 
     Returns:
         JSON with navigation result.
 
     Example:
-        browser_go_back(session_id="abc123")
+        webreader_browser_go_back(session_id="abc123")
     """
     try:
         session = _validate_session(session_id)
@@ -727,23 +746,23 @@ async def browser_go_back(session_id: str) -> str:
         await asyncio.sleep(1)
 
         return json.dumps({
-            "tool": "browser_go_back",
+            "tool": "webreader_browser_go_back",
             "status": "success",
             "session_id": session_id,
             "url": page.url,
             "title": await page.title(),
-            "message": f"Navigated back. URL: {page.url}. Call browser_get_state() to read content.",
+            "message": f"Navigated back. URL: {page.url}. Call webreader_browser_get_state() to read content.",
             "next_steps": [
-                f"browser_get_state(session_id=\"{session_id}\")  — Read content",
-                f"browser_go_forward(session_id=\"{session_id}\")  — Go forward",
+                f"webreader_browser_get_state(session_id=\"{session_id}\")  — Read content",
+                f"webreader_browser_go_forward(session_id=\"{session_id}\")  — Go forward",
             ],
         }, indent=2, ensure_ascii=False)
 
     except ConnectionError as e:
-        return json.dumps({"tool": "browser_go_back", "status": "error", "message": str(e)}, indent=2)
+        return json.dumps({"tool": "webreader_browser_go_back", "status": "error", "message": str(e)}, indent=2)
     except Exception as e:
         return json.dumps({
-            "tool": "browser_go_back",
+            "tool": "webreader_browser_go_back",
             "status": "error",
             "session_id": session_id,
             "message": str(e),
@@ -751,17 +770,17 @@ async def browser_go_back(session_id: str) -> str:
 
 
 @mcp.tool()
-async def browser_go_forward(session_id: str) -> str:
+async def webreader_browser_go_forward(session_id: str) -> str:
     """Go forward in the session's browser history.
 
     Args:
-        session_id: The session from browser_open()
+        session_id: The session from webreader_browser_open()
 
     Returns:
         JSON with navigation result.
 
     Example:
-        browser_go_forward(session_id="abc123")
+        webreader_browser_go_forward(session_id="abc123")
     """
     try:
         session = _validate_session(session_id)
@@ -773,23 +792,23 @@ async def browser_go_forward(session_id: str) -> str:
         await asyncio.sleep(1)
 
         return json.dumps({
-            "tool": "browser_go_forward",
+            "tool": "webreader_browser_go_forward",
             "status": "success",
             "session_id": session_id,
             "url": page.url,
             "title": await page.title(),
-            "message": f"Navigated forward. URL: {page.url}. Call browser_get_state() to read content.",
+            "message": f"Navigated forward. URL: {page.url}. Call webreader_browser_get_state() to read content.",
             "next_steps": [
-                f"browser_get_state(session_id=\"{session_id}\")  — Read content",
-                f"browser_go_back(session_id=\"{session_id}\")  — Go back",
+                f"webreader_browser_get_state(session_id=\"{session_id}\")  — Read content",
+                f"webreader_browser_go_back(session_id=\"{session_id}\")  — Go back",
             ],
         }, indent=2, ensure_ascii=False)
 
     except ConnectionError as e:
-        return json.dumps({"tool": "browser_go_forward", "status": "error", "message": str(e)}, indent=2)
+        return json.dumps({"tool": "webreader_browser_go_forward", "status": "error", "message": str(e)}, indent=2)
     except Exception as e:
         return json.dumps({
-            "tool": "browser_go_forward",
+            "tool": "webreader_browser_go_forward",
             "status": "error",
             "session_id": session_id,
             "message": str(e),
@@ -797,7 +816,7 @@ async def browser_go_forward(session_id: str) -> str:
 
 
 @mcp.tool()
-async def browser_screenshot(
+async def webreader_browser_screenshot(
     session_id: str,
     max_dimension: int = 768,
     colors: int = 16,
@@ -811,7 +830,7 @@ async def browser_screenshot(
     to keep base64 output small for LLM context windows.
 
     Args:
-        session_id: The session from browser_open()
+        session_id: The session from webreader_browser_open()
         max_dimension: Max width/height in pixels (default: 768). The smaller dimension
                        is scaled proportionally. Set to 1920 for full resolution.
         colors: Color palette size 1–256 (default: 16). Uses Pillow quantization.
@@ -829,16 +848,16 @@ async def browser_screenshot(
         JSON with screenshot data (base64) or file path.
 
     Example:
-        browser_screenshot(session_id="abc123")
+        webreader_browser_screenshot(session_id="abc123")
         → Small base64 PNG, ~16 colors, max 768px
 
-        browser_screenshot(session_id="abc123", fmt="jpeg", quality=90)
+        webreader_browser_screenshot(session_id="abc123", fmt="jpeg", quality=90)
         → Small base64 JPEG, full color, ~20KB
 
-        browser_screenshot(session_id="abc123", max_dimension=1920, colors=256, fmt="png")
+        webreader_browser_screenshot(session_id="abc123", max_dimension=1920, colors=256, fmt="png")
         → Large base64 PNG, full color, ~500KB
 
-        browser_screenshot(session_id="abc123", path="/tmp/screen.jpg")
+        webreader_browser_screenshot(session_id="abc123", path="/tmp/screen.jpg")
         → Saved to file as JPEG
     """
     try:
@@ -915,7 +934,7 @@ async def browser_screenshot(
         file_ext = ext_map.get(fmt, "png")
 
         result = {
-            "tool": "browser_screenshot",
+            "tool": "webreader_browser_screenshot",
             "status": "success",
             "session_id": session_id,
             "url": page.url,
@@ -926,15 +945,15 @@ async def browser_screenshot(
             "file_size_estimate": f"{len(screenshot_bytes) / 1024:.1f} KB",
             "message": "Screenshot captured.",
             "next_steps": [
-                f"browser_get_state(session_id=\"{session_id}\")  — Read page content",
-                f"browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click element",
+                f"webreader_browser_get_state(session_id=\"{session_id}\")  — Read page content",
+                f"webreader_browser_click(session_id=\"{session_id}\", selector=\"#x\")  — Click element",
             ],
         }
 
         if path:
             Path(path).write_bytes(screenshot_bytes)
             return json.dumps({
-                "tool": "browser_screenshot",
+                "tool": "webreader_browser_screenshot",
                 "status": "success",
                 "session_id": session_id,
                 "url": page.url,
@@ -979,38 +998,38 @@ async def browser_screenshot(
 
 
 @mcp.tool()
-async def browser_close(session_id: str) -> str:
+async def webreader_browser_close(session_id: str) -> str:
     """Close a browsing session and free resources.
 
     Args:
-        session_id: The session from browser_open()
+        session_id: The session from webreader_browser_open()
 
     Returns:
         JSON confirming closure.
 
     Example:
-        browser_close(session_id="abc123")
+        webreader_browser_close(session_id="abc123")
         → {"status": "success", "message": "Session closed."}
     """
     try:
         _validate_session(session_id)  # Check it exists
         await _destroy_session(session_id, "user_closed")
         return json.dumps({
-            "tool": "browser_close",
+            "tool": "webreader_browser_close",
             "status": "success",
             "session_id": session_id,
-            "message": f"Session '{session_id}' closed. Call browser_open() to start a new session.",
+            "message": f"Session '{session_id}' closed. Call webreader_browser_open() to start a new session.",
         }, indent=2, ensure_ascii=False)
     except ConnectionError:
         return json.dumps({
-            "tool": "browser_close",
+            "tool": "webreader_browser_close",
             "status": "error",
             "session_id": session_id,
             "message": f"Session '{session_id}' not found or already closed.",
         }, indent=2)
     except Exception as e:
         return json.dumps({
-            "tool": "browser_close",
+            "tool": "webreader_browser_close",
             "status": "error",
             "session_id": session_id,
             "message": str(e),
