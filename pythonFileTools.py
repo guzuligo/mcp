@@ -21,6 +21,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,14 @@ from fastmcp import FastMCP
 
 # Create a FastMCP server instance
 mcp = FastMCP("Python File Tools")
+
+# =============================================================================
+# Configurable defaults (can be overridden via environment variables)
+# =============================================================================
+
+# Default number of lines to return from get_command_output when tail > 0.
+# Override via environment variable: export MCP_DEFAULT_TAIL_LINES=30
+_DEFAULT_TAIL_LINES = int(os.environ.get("MCP_DEFAULT_TAIL_LINES", "20"))
 
 
 @mcp.tool()
@@ -1088,13 +1097,43 @@ def _add_to_history(entry):
         _process_history = _process_history[:_MAX_HISTORY]
 
 
+def _read_output_from_file(output_file):
+    """Read output captured to the tee/Tee-Object output file.
+
+    Returns (stdout, stderr) tuple. For tee (Linux/macOS), all output is stdout.
+    For PowerShell Tee-Object with 2>&1, stderr is redirected into stdout stream.
+    """
+    try:
+        with open(output_file, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        return content, ''
+    except FileNotFoundError:
+        return '', ''
+
+
 def _get_all_output_from_registry(process_id):
-    """Get all accumulated output from the registry (memory + file)."""
+    """Get all accumulated output from the registry (memory + file).
+
+    For visible processes, first checks _final_stdout/_final_stderr set by the
+    background monitor thread when the process completes. Falls back to reading
+    the output file directly if the monitor hasn't finished yet.
+    """
     if process_id not in _process_registry:
         return "", ""
 
     entry = _process_registry[process_id]
-    # Get chunks stored directly in memory
+    is_visible = entry.get("is_visible", False)
+
+    if is_visible:
+        # Check if the background monitor has already saved final output
+        final_stdout = entry.get("_final_stdout")
+        final_stderr = entry.get("_final_stderr")
+        if final_stdout is not None or final_stderr is not None:
+            return final_stdout or "", final_stderr or ""
+        # Monitor hasn't finished yet — read file directly
+        return _read_output_from_file(entry["output_file"])
+
+    # Hidden mode: get chunks stored directly in memory
     stdout_chunks = entry.get("stdout_chunks", [])
     stderr_chunks = entry.get("stderr_chunks", [])
     stdout_from_mem = ''.join(stdout_chunks) if stdout_chunks else ''
@@ -1118,23 +1157,197 @@ def _get_all_output_from_registry(process_id):
     return stdout_from_mem if stdout_from_mem else file_stdout, stderr_from_mem if stderr_from_mem else file_stderr
 
 
+def _get_visible_process_args(command: str, working_dir: str, output_file: str):
+    """Return (args_list, creation_flags) for a visible terminal process.
+
+    Wraps the command with `tee` (Linux/macOS) or `Tee-Object` (Windows) so that
+    output is both displayed in the terminal AND captured to a file.
+    Appends a short delay so the terminal stays open long enough for the file to flush.
+
+    Returns (None, 0) if no visible terminal is available on this platform.
+    """
+    creation_flags = 0
+    args_list = None
+
+    if sys.platform == "win32":
+        # Windows: use PowerShell Tee-Object to capture output while displaying
+        # Use system temp directory for reliable file path
+        temp_dir = os.environ.get("TEMP", "C:\\temp")
+        escaped_cmd = command.replace('"', "'")
+        wrapped_cmd = f'{escaped_cmd} 2>&1 | Tee-Object -FilePath "{output_file}"; Start-Sleep -Seconds 5'
+        creation_flags = subprocess.CREATE_NEW_CONSOLE
+        args_list = ["powershell", "-NoProfile", "-Command", wrapped_cmd]
+
+    elif sys.platform == "darwin":
+        # macOS: use osascript to open Terminal.app with tee capture
+        # Append sleep to keep terminal open for file flush
+        script = f'''tell application "Terminal" to do script "{command} 2>&1 | tee {output_file}; sleep 5"'''
+        args_list = ["osascript", "-e", script]
+
+    elif sys.platform == "linux":
+        # Linux: detect display server and try available terminal emulators
+        display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        if not display:
+            # Headless / no display server — no visible terminal available
+            return None, 0
+
+        # Wrap command with tee to capture output to file while displaying
+        # Append sleep to keep terminal open for file flush
+        wrapped_command = f'{command} 2>&1 | tee {output_file}; sleep 5'
+
+        # Try terminal emulators in order of popularity
+        terminal_candidates = [
+            ("gnome-terminal", ["gnome-terminal", "--", "sh", "-c", wrapped_command]),
+            ("konsole", ["konsole", "-e", "sh", "-c", wrapped_command]),
+            ("xterm", ["xterm", "-e", "sh", "-c", wrapped_command]),
+            ("xfce4-terminal", ["xfce4-terminal", "--", "sh", "-c", wrapped_command]),
+            ("lxterminal", ["lxterminal", "-e", "sh", "-c", wrapped_command]),
+            ("mate-terminal", ["mate-terminal", "-e", "sh", "-c", wrapped_command]),
+        ]
+
+        for name, cmd in terminal_candidates:
+            if subprocess.run(["which", name], capture_output=True, stdin=subprocess.DEVNULL).returncode == 0:
+                args_list = cmd
+                break
+
+    return args_list, creation_flags
+
+
+def _run_visible_command(command: str, working_dir: str, process_id: str, output_file: str, effective_timeout: int):
+    """Run a command in a visible terminal. Returns process handle or None on failure.
+
+    For visible mode, we do NOT capture stdout/stderr via pipes — the terminal emulator
+    displays output in the GUI. Output is captured via `tee` writing to output_file.
+
+    Starts a background thread that monitors the process and saves output to the registry
+    when the process completes, ensuring output is preserved even after the terminal closes.
+    """
+    args, flags = _get_visible_process_args(command, working_dir, output_file)
+    if args is None:
+        return None, 0
+
+    def _monitor_visible_process(process_id, ofile):
+        """Background thread: wait for process to complete, then save output to registry."""
+        try:
+            # Wait for the process to finish (with a timeout)
+            entry = _process_registry.get(process_id)
+            if entry is None:
+                return
+            process = entry["process"]
+
+            # Poll every 0.5 seconds for process completion
+            while True:
+                poll_result = process.poll()
+                if poll_result is not None:
+                    # Process completed — wait briefly for file to flush, then read
+                    time.sleep(1)  # Allow tee to finish writing and flush to disk
+                    stdout_content, stderr_content = _read_output_from_file(ofile)
+
+                    # Store in registry for get_command_output to read
+                    if process_id in _process_registry:
+                        _process_registry[process_id]["_final_stdout"] = stdout_content
+                        _process_registry[process_id]["_final_stderr"] = stderr_content
+                        _process_registry[process_id]["_final_return_code"] = poll_result
+
+                    # Add to history
+                    _add_to_history({
+                        "process_id": process_id,
+                        "command": command,
+                        "return_code": poll_result,
+                        "start_time": _process_registry[process_id].get("start_time"),
+                        "end_time": time.time(),
+                        "stdout": stdout_content,
+                        "stderr": stderr_content,
+                    })
+                    break
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+    try:
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=working_dir,
+            stdin=subprocess.DEVNULL,
+            universal_newlines=True,
+            creationflags=flags,
+        )
+
+        # Start background monitor thread to save output when process completes
+        monitor_thread = threading.Thread(
+            target=_monitor_visible_process,
+            args=(process_id, output_file),
+            daemon=True,
+        )
+        monitor_thread.start()
+
+        return process, 0
+    except Exception:
+        return None, 0
+
+
+def _run_hidden_command(command: str, working_dir: str, process_id: str, output_file: str, effective_timeout: int):
+    """Run a command in hidden mode (default behavior). Returns process handle."""
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=working_dir,
+        stdin=subprocess.DEVNULL,
+        universal_newlines=True,
+    )
+    return process, 0
+
+
+def _apply_tail(text, n):
+    """Return the last n lines of text, or all text if n <= 0.
+
+    Returns (result_text, total_lines, returned_lines) tuple.
+    """
+    if n <= 0:
+        total = len(text.splitlines()) if text else 0
+        return text, total, total
+    lines = text.splitlines()
+    total = len(lines)
+    if total <= n:
+        return text, total, total
+    return '\n'.join(lines[-n:]), total, n
+
+
 @mcp.tool()
-def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4) -> dict:
-    """Execute a bash command and return the result with progressive output for LM Studio visibility.
+def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4, visible: bool = True, show_output: bool = False) -> dict:
+    """Execute a command and optionally show it in a visible terminal window.
 
     The process is tracked in a shared registry so that get_command_output can retrieve partial results
     as they arrive. This allows LM Studio to see output incrementally during long-running commands.
     Output is stored immediately in memory (not just files) so it survives temp file cleanup.
 
+    When `visible` is True, the command runs in a platform-specific terminal emulator:
+      - Windows: opens a new cmd console window
+      - Linux: uses xterm, gnome-terminal, konsole, or similar (requires DISPLAY)
+      - macOS: opens a new tab in Terminal.app
+
+    If no visible terminal is available, the command falls back to hidden mode.
+
     Args:
-        command: The bash command to execute.
+        command: The command to execute.
         working_dir: The working directory to execute the command in. Default: current directory
         timeout: Maximum execution time in seconds for the process itself. Default: 300
         wait_time: Recommended wait time in seconds between polling calls. Default: 4
+        visible: If True, run the command in a visible terminal window. Default: True
+        show_output: If True, include a preview of the first 50 lines of captured output in the response.
+                     Default: False (no output preview, saves tokens on initial call).
+                     Use this when you want an immediate snapshot of early output.
+                     For full or filtered output later, use get_command_output with the returned process_id.
 
     Returns:
-        A dictionary with stdout, stderr, return code, and execution time.
+        A dictionary with process_id, return code, execution time, and optionally output preview.
         Includes output_file path for get_command_output to read progressive results.
+        Includes a 'visible' field indicating whether the terminal was actually opened.
+        When show_output=True, includes 'stdout' and 'stderr' with the first 50 lines each.
     """
     start_time = time.time()
     process_id = str(uuid.uuid4())
@@ -1144,75 +1357,102 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
     effective_timeout = max(timeout, wait_time)
 
     try:
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=working_dir,
-            stdin=subprocess.DEVNULL,
-            universal_newlines=True,
-        )
+        # Choose visible or hidden execution
+        if visible:
+            process, creation_flags = _run_visible_command(command, working_dir, process_id, output_file, effective_timeout)
+            if process is not None:
+                use_visible = True
+            else:
+                # No visible terminal available — fall back to hidden
+                use_visible = False
+        else:
+            use_visible = False
 
-        # Store in registry with immediate memory storage for output
+        if not use_visible:
+            # Hidden mode: use shell=True with pipes
+            process, creation_flags = _run_hidden_command(command, working_dir, process_id, output_file, effective_timeout)
+
+        # Store in registry
         _process_registry[process_id] = {
             "process": process,
             "output_file": output_file,
             "command": command,
             "start_time": start_time,
             "effective_timeout": effective_timeout,
-            "stdout_chunks": [],  # Immediate memory storage for stdout
-            "stderr_chunks": [],  # Immediate memory storage for stderr
+            "is_visible": use_visible,
+            "stdout_chunks": [],  # Immediate memory storage for stdout (hidden mode only)
+            "stderr_chunks": [],  # Immediate memory storage for stderr (hidden mode only)
         }
 
-        # Use threading to read stdout and stderr concurrently without blocking
-        def read_stdout():
-            """Read from stdout pipe until EOF."""
-            try:
-                while True:
-                    line = process.stdout.readline()
-                    if line == '':
-                        break
-                    _process_registry[process_id]["stdout_chunks"].append(line)
-            except Exception:
-                pass
+        # For hidden mode only: use threading to read stdout and stderr concurrently
+        if not use_visible:
+            def read_stdout():
+                """Read from stdout pipe until EOF."""
+                try:
+                    while True:
+                        line = process.stdout.readline()
+                        if line == '':
+                            break
+                        _process_registry[process_id]["stdout_chunks"].append(line)
+                except Exception:
+                    pass
 
-        def read_stderr():
-            """Read from stderr pipe until EOF."""
-            try:
-                while True:
-                    line = process.stderr.readline()
-                    if line == '':
-                        break
-                    _process_registry[process_id]["stderr_chunks"].append(line)
-            except Exception:
-                pass
+            def read_stderr():
+                """Read from stderr pipe until EOF."""
+                try:
+                    while True:
+                        line = process.stderr.readline()
+                        if line == '':
+                            break
+                        _process_registry[process_id]["stderr_chunks"].append(line)
+                except Exception:
+                    pass
 
-        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
-        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-        stdout_thread.start()
-        stderr_thread.start()
+            stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
 
-        # Return immediately - process continues running in background threads
+        # Return immediately - process continues running
         # The caller can poll get_command_output for updates as more output arrives
         end_time = time.time()
         execution_time = end_time - start_time
 
         proc_status = process.poll()
 
+        visible_terminal_opened = use_visible
+
+        # Optionally capture initial output preview
+        initial_stdout = ''
+        initial_stderr = ''
+        if show_output:
+            if use_visible:
+                initial_stdout, initial_stderr = _read_output_from_file(output_file)
+            else:
+                initial_stdout = ''.join(_process_registry[process_id].get("stdout_chunks", []))
+                initial_stderr = ''.join(_process_registry[process_id].get("stderr_chunks", []))
+
+        stdout_preview, stdout_total, stdout_returned = _apply_tail(initial_stdout, 50)
+        stderr_preview, stderr_total, stderr_returned = _apply_tail(initial_stderr, 50)
         return {
             "command": command,
             "working_dir": os.path.abspath(working_dir),
             "process_id": process_id,
             "output_file": output_file,
             "return_code": proc_status if proc_status is not None else None,
-            "stdout": '',  # Will be populated by threads
-            "stderr": '',
+            "stdout": stdout_preview,
+            "stderr": stderr_preview,
             "success": (proc_status == 0) if proc_status is not None else None,
             "is_complete": proc_status is not None,
             "execution_time_seconds": round(execution_time, 3),
             "recommended_wait_time": wait_time,
             "effective_timeout": effective_timeout,
+            "visible": visible_terminal_opened,
+            "show_output": show_output,
+            "output_summary": {
+                "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+                "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+            },
         }
 
     except subprocess.TimeoutExpired:
@@ -1220,19 +1460,30 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
         execution_time = end_time - start_time
         try:
             process.kill()
-        except ProcessLookupError:
+        except (ProcessLookupError, AttributeError):
             pass
+        # Try to read any output captured so far
+        captured_stdout, captured_stderr = _read_output_from_file(output_file)
+        timeout_msg = captured_stderr + "\n[TIMEOUT] Command timed out after {} seconds".format(effective_timeout)
+        stdout_preview, stdout_total, stdout_returned = _apply_tail(captured_stdout, 50) if show_output else (captured_stdout, len(captured_stdout.splitlines()) if captured_stdout else 0, len(captured_stdout.splitlines()) if captured_stdout else 0)
+        stderr_preview, stderr_total, stderr_returned = _apply_tail(timeout_msg, 50) if show_output else (timeout_msg, len(timeout_msg.splitlines()) if timeout_msg else 0, len(timeout_msg.splitlines()) if timeout_msg else 0)
         return {
             "command": command,
             "working_dir": os.path.abspath(working_dir),
             "process_id": process_id,
             "output_file": output_file,
             "return_code": -1,
-            "stdout": "",
-            "stderr": f"Command timed out after {effective_timeout} seconds",
+            "stdout": stdout_preview,
+            "stderr": stderr_preview,
             "success": False,
             "is_complete": True,
             "execution_time_seconds": round(execution_time, 3),
+            "visible": False,
+            "show_output": show_output,
+            "output_summary": {
+                "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+                "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+            },
         }
 
     except Exception as e:
@@ -1249,23 +1500,49 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
             "success": False,
             "is_complete": True,
             "execution_time_seconds": round(execution_time, 3),
+            "visible": False,
+            "show_output": show_output,
+            "output_summary": {
+                "stdout": {"total_lines": 0, "returned_lines": 0, "lines_omitted": 0},
+                "stderr": {"total_lines": 1, "returned_lines": 1, "lines_omitted": 0},
+            },
         }
 
 
 @mcp.tool()
-def get_command_output(output_file: str = None, process_id: str = None, wait_time: int = 4) -> dict:
+def get_command_output(
+    output_file: str = None,
+    process_id: str = None,
+    wait_time: int = 4,
+    tail: int = None,
+) -> dict:
     """Get the current output from a previously started command.
 
-    Reads accumulated output from memory (primary) and file (fallback).
+    Reads accumulated output from memory (hidden mode) or file (visible mode).
     Useful for polling during long-running commands after calling execute_command.
+
+    For visible processes, this reads from the tee/Tee-Object output file.
+    Returns is_complete=True and status='completed' if the process has finished,
+    or is_complete=False and status='running' if still active.
 
     Args:
         process_id: The UUID from execute_command. Required.
         wait_time: Recommended wait time in seconds between polling calls. Default: 4
+        tail: Number of lines to return from the end of output.
+              - None (default) → uses the server-wide default (20 lines).
+                Override via environment variable: MCP_DEFAULT_TAIL_LINES=30
+              - 0 → returns full stdout and stderr (no filtering)
+              - 10 → returns only the last 10 lines of stdout and stderr
+              - 20 → returns only the last 20 lines of stdout and stderr
 
     Returns:
-        A dictionary with accumulated stdout, stderr, and metadata about the last read time.
+        A dictionary with accumulated stdout, stderr, is_complete, status, and metadata.
+        When tail > 0, stdout and stderr contain only the last N lines each.
+        Includes 'output_summary' with total_lines, returned_lines, and lines_omitted counts.
     """
+    # Resolve tail: None → use server default; 0 → return all; >0 → return last N
+    if tail is None:
+        tail = _DEFAULT_TAIL_LINES
     if not process_id:
         return {
             "stdout": "",
@@ -1275,17 +1552,68 @@ def get_command_output(output_file: str = None, process_id: str = None, wait_tim
             "message": "'process_id' must be provided.",
         }
 
+    if process_id not in _process_registry:
+        # Check history for completed processes
+        for entry in _process_history:
+            if entry["process_id"] == process_id:
+                stdout = entry.get("stdout", "")
+                stderr = entry.get("stderr", "")
+                stdout_result, stdout_total, stdout_returned = _apply_tail(stdout, tail)
+                stderr_result, stderr_total, stderr_returned = _apply_tail(stderr, tail)
+                return {
+                    "process_id": process_id,
+                    "stdout": stdout_result,
+                    "stderr": stderr_result,
+                    "success": entry.get("return_code") == 0,
+                    "is_complete": True,
+                    "status": "completed" if entry.get("return_code") == 0 else "failed",
+                    "return_code": entry.get("return_code"),
+                    "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "recommended_wait_time": wait_time,
+                    "output_summary": {
+                        "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+                        "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+                    },
+                }
+        return {
+            "process_id": process_id,
+            "stdout": "",
+            "stderr": "",
+            "success": False,
+            "is_complete": True,
+            "status": "not_found",
+            "message": f"Process '{process_id}' not found. It may have already completed or been cleaned up.",
+            "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "recommended_wait_time": wait_time,
+        }
+
+    entry = _process_registry[process_id]
+    process = entry["process"]
+
+    # Check if process is still running
+    poll_result = process.poll()
+    is_complete = (poll_result is not None)
+
     # Get all output from registry (memory + file)
     stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
 
+    stdout_result, stdout_total, stdout_returned = _apply_tail(stdout_from_mem if stdout_from_mem else '', tail)
+    stderr_result, stderr_total, stderr_returned = _apply_tail(stderr_from_mem if stderr_from_mem else '', tail)
+
     return {
         "process_id": process_id,
-        "stdout": stdout_from_mem if stdout_from_mem else '',
-        "stderr": stderr_from_mem if stderr_from_mem else '',
-        "success": True,
-        "is_complete": False,
+        "stdout": stdout_result,
+        "stderr": stderr_result,
+        "success": (poll_result == 0) if is_complete else None,
+        "is_complete": is_complete,
+        "status": "completed" if (is_complete and poll_result == 0) else ("failed" if is_complete and poll_result is not None else "running"),
+        "return_code": poll_result if is_complete else None,
         "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "recommended_wait_time": wait_time,
+        "output_summary": {
+            "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+            "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+        },
     }
 
 
@@ -1309,14 +1637,12 @@ def check_progress(process_id: str) -> dict:
             if entry["process_id"] == process_id:
                 return {
                     "process_id": process_id,
-                    "command": entry["command"],
+                    "command": entry.get("command", ""),
                     "is_running": False,
                     "return_code": entry.get("return_code"),
-                    "stdout": entry.get("stdout", ""),
-                    "stderr": entry.get("stderr", ""),
+                    "status": "completed" if entry.get("return_code") == 0 else "failed",
                     "output_file": entry.get("output_file"),
                     "current_output_length": len(entry.get("stdout", "")) + len(entry.get("stderr", "")),
-                    "status": "completed" if entry.get("return_code") == 0 else ("failed" if entry.get("return_code is not None") else "unknown"),
                 }
         return {
             "status": "error",
@@ -1424,14 +1750,25 @@ def kill_process(process_id: str) -> dict:
             status_msg = "killed with SIGKILL"
 
         # Add to history before removing from registry
+        # For visible processes, also try to capture final output from file
+        if entry.get("is_visible", False):
+            final_stdout, final_stderr = _read_output_from_file(entry["output_file"])
+            if not final_stdout:
+                final_stdout = ''.join(entry.get("stdout_chunks", []))
+            if not final_stderr:
+                final_stderr = ''.join(entry.get("stderr_chunks", []))
+        else:
+            final_stdout = ''.join(entry.get("stdout_chunks", []))
+            final_stderr = ''.join(entry.get("stderr_chunks", []))
+
         _add_to_history({
             "process_id": process_id,
             "command": entry["command"],
             "return_code": process.returncode if hasattr(process, 'returncode') else None,
             "start_time": entry.get("start_time"),
             "end_time": time.time(),
-            "stdout": ''.join(entry.get("stdout_chunks", [])),
-            "stderr": ''.join(entry.get("stderr_chunks", [])),
+            "stdout": final_stdout,
+            "stderr": final_stderr,
         })
 
         # Clean up registry entry
@@ -1448,6 +1785,85 @@ def kill_process(process_id: str) -> dict:
             "status": "error",
             "killed_process_id": process_id,
             "message": f"Error killing process: {e}",
+        }
+
+
+@mcp.tool()
+def wait_for_process(process_id: str = None, wait_time: int = 10) -> dict:
+    """Wait for a specified duration, optionally waiting for a process to complete.
+
+    This tool blocks execution for the specified number of seconds, allowing the LLM
+    to give time for long-running commands to produce output without spamming
+    get_command_output or check_progress calls.
+
+    When a process_id is provided, the tool will return early if the process completes
+    before the wait_time expires (checked every second).
+
+    Args:
+        process_id: Optional process ID to wait for. If provided, the tool will wait
+                    for the shorter of wait_time or process completion.
+        wait_time: Number of seconds to wait. Default: 10
+
+    Returns:
+        Dictionary with status, waited_seconds, and optionally process status.
+    """
+    start_time = time.time()
+    elapsed = 0.0
+
+    if process_id:
+        # Wait for process with periodic progress checks
+        while elapsed < wait_time:
+            if process_id not in _process_registry:
+                # Process already removed from registry — it was likely killed
+                actual_waited = round(time.time() - start_time, 2)
+                return {
+                    "status": "success",
+                    "waited_seconds": actual_waited,
+                    "process_id": process_id,
+                    "process_completed": True,
+                    "message": "Process was removed from registry (likely killed).",
+                }
+
+            entry = _process_registry[process_id]
+            poll_result = entry["process"].poll()
+
+            if poll_result is not None:
+                # Process has completed
+                actual_waited = round(time.time() - start_time, 2)
+                return {
+                    "status": "success",
+                    "waited_seconds": actual_waited,
+                    "process_id": process_id,
+                    "command": entry["command"],
+                    "return_code": poll_result,
+                    "process_completed": True,
+                    "success": poll_result == 0,
+                    "status_msg": "completed" if poll_result == 0 else "failed",
+                }
+
+            # Process still running — sleep a bit and check again
+            time.sleep(1)
+            elapsed = time.time() - start_time
+
+        # Waited full duration but process still running
+        actual_waited = round(time.time() - start_time, 2)
+        return {
+            "status": "success",
+            "waited_seconds": actual_waited,
+            "process_id": process_id,
+            "command": entry["command"],
+            "process_completed": False,
+            "message": "Wait time elapsed. Process is still running.",
+        }
+
+    else:
+        # No process_id — just sleep for the specified duration
+        time.sleep(wait_time)
+        actual_waited = round(time.time() - start_time, 2)
+        return {
+            "status": "success",
+            "waited_seconds": actual_waited,
+            "message": f"Waited {actual_waited} seconds.",
         }
 
 
@@ -1513,21 +1929,8 @@ def git_init(path: str, overwrite: bool = False) -> dict:
 
         return {
             "path": str(dir_path),
-            "status": "initialized",
-            "content_changed": True,
-            "total_changes": 1,
-            "applied_changes": [
-                {
-                    "index": 0,
-                    "search": "",
-                    "replace": ".git directory",
-                    "mode": "exact",
-                    "status": "proposed",
-                    "replacements_made": 1,
-                }
-            ],
-            "diff": "",
-            "commit_hash": None,
+            "status": "success",
+            "message": f"Git repository initialized at '{dir_path}'.",
         }
 
     except subprocess.TimeoutExpired:
@@ -1535,8 +1938,6 @@ def git_init(path: str, overwrite: bool = False) -> dict:
             "path": str(dir_path),
             "status": "error",
             "message": "git init timed out",
-            "content_changed": False,
-            "total_changes": 1,
         }
 
 
