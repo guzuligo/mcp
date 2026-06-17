@@ -1318,7 +1318,7 @@ def _apply_tail(text, n):
 
 
 @mcp.tool()
-def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4, visible: bool = True, show_output: bool = False) -> dict:
+def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4, visible: bool = False, show_output: bool = False) -> dict:
     """Execute a command and optionally show it in a visible terminal window.
 
     The process is tracked in a shared registry so that get_command_output can retrieve partial results
@@ -1332,12 +1332,18 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
 
     If no visible terminal is available, the command falls back to hidden mode.
 
+    By default, commands run in invisible/hidden mode. Use `visible=True` only when you need
+    to see the terminal window (e.g., for interactive GUI applications).
+
+    For fast commands that complete quickly, this tool returns the full output immediately.
+    For long-running commands, it returns a process_id that can be used with get_command_output.
+
     Args:
         command: The command to execute.
         working_dir: The working directory to execute the command in. Default: current directory
         timeout: Maximum execution time in seconds for the process itself. Default: 300
         wait_time: Recommended wait time in seconds between polling calls. Default: 4
-        visible: If True, run the command in a visible terminal window. Default: True
+        visible: If True, run the command in a visible terminal window. Default: False (hidden)
         show_output: If True, include a preview of the first 50 lines of captured output in the response.
                      Default: False (no output preview, saves tokens on initial call).
                      Use this when you want an immediate snapshot of early output.
@@ -1348,6 +1354,7 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
         Includes output_file path for get_command_output to read progressive results.
         Includes a 'visible' field indicating whether the terminal was actually opened.
         When show_output=True, includes 'stdout' and 'stderr' with the first 50 lines each.
+        When the command completes instantly, includes full stdout and stderr.
     """
     start_time = time.time()
     process_id = str(uuid.uuid4())
@@ -1413,24 +1420,74 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
             stdout_thread.start()
             stderr_thread.start()
 
-        # Return immediately - process continues running
+        # For hidden mode: wait briefly to check if the command completes instantly
+        # This provides immediate feedback for fast commands like 'echo', 'ls', etc.
+        if not use_visible:
+            # Wait a very short time for the reader threads to capture output
+            time.sleep(0.1)
+            proc_status = process.poll()
+
+            # If command completed instantly, capture final output immediately
+            if proc_status is not None:
+                # Wait a bit more for threads to finish reading
+                stdout_thread.join(timeout=1.0)
+                stderr_thread.join(timeout=1.0)
+
+                initial_stdout = ''.join(_process_registry[process_id].get("stdout_chunks", []))
+                initial_stderr = ''.join(_process_registry[process_id].get("stderr_chunks", []))
+
+                # Add to history for completed fast commands
+                _add_to_history({
+                    "process_id": process_id,
+                    "command": command,
+                    "return_code": proc_status,
+                    "start_time": start_time,
+                    "end_time": time.time(),
+                    "stdout": initial_stdout,
+                    "stderr": initial_stderr,
+                })
+
+                # Remove from registry since it's complete
+                del _process_registry[process_id]
+
+                end_time = time.time()
+                execution_time = end_time - start_time
+                stdout_preview, stdout_total, stdout_returned = _apply_tail(initial_stdout, 50)
+                stderr_preview, stderr_total, stderr_returned = _apply_tail(initial_stderr, 50)
+                return {
+                    "command": command,
+                    "working_dir": os.path.abspath(working_dir),
+                    "process_id": process_id,
+                    "output_file": output_file,
+                    "return_code": proc_status,
+                    "stdout": stdout_preview,
+                    "stderr": stderr_preview,
+                    "success": (proc_status == 0),
+                    "is_complete": True,
+                    "execution_time_seconds": round(execution_time, 3),
+                    "recommended_wait_time": 0,
+                    "effective_timeout": effective_timeout,
+                    "visible": False,
+                    "show_output": show_output,
+                    "instant_feedback": True,
+                    "output_summary": {
+                        "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+                        "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+                    },
+                }
+
+        # Return immediately for long-running processes
         # The caller can poll get_command_output for updates as more output arrives
         end_time = time.time()
         execution_time = end_time - start_time
 
-        proc_status = process.poll()
-
         visible_terminal_opened = use_visible
 
-        # Optionally capture initial output preview
+        # Optionally capture initial output preview for visible processes
         initial_stdout = ''
         initial_stderr = ''
-        if show_output:
-            if use_visible:
-                initial_stdout, initial_stderr = _read_output_from_file(output_file)
-            else:
-                initial_stdout = ''.join(_process_registry[process_id].get("stdout_chunks", []))
-                initial_stderr = ''.join(_process_registry[process_id].get("stderr_chunks", []))
+        if show_output and use_visible:
+            initial_stdout, initial_stderr = _read_output_from_file(output_file)
 
         stdout_preview, stdout_total, stdout_returned = _apply_tail(initial_stdout, 50)
         stderr_preview, stderr_total, stderr_returned = _apply_tail(initial_stderr, 50)
@@ -1439,16 +1496,17 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
             "working_dir": os.path.abspath(working_dir),
             "process_id": process_id,
             "output_file": output_file,
-            "return_code": proc_status if proc_status is not None else None,
+            "return_code": None,
             "stdout": stdout_preview,
             "stderr": stderr_preview,
-            "success": (proc_status == 0) if proc_status is not None else None,
-            "is_complete": proc_status is not None,
+            "success": None,
+            "is_complete": False,
             "execution_time_seconds": round(execution_time, 3),
             "recommended_wait_time": wait_time,
             "effective_timeout": effective_timeout,
             "visible": visible_terminal_opened,
             "show_output": show_output,
+            "instant_feedback": False,
             "output_summary": {
                 "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
                 "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
@@ -1509,24 +1567,53 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
         }
 
 
+def _get_latest_process_id() -> str | None:
+    """Get the process_id of the most recently started process from the registry or history.
+
+    Returns the process_id of the latest process, or None if no processes exist.
+    """
+    # First check registry for any running processes
+    if _process_registry:
+        # Return the last key (most recently added in Python 3.7+)
+        return next(reversed(_process_registry))
+
+    # Then check history for completed processes
+    if _process_history:
+        return _process_history[0].get("process_id")
+
+    return None
+
+
 @mcp.tool()
 def get_command_output(
-    output_file: str = None,
     process_id: str = None,
     wait_time: int = 4,
     tail: int = None,
+    wait_for_completion: bool = False,
+    timeout: int = 10,
 ) -> dict:
     """Get the current output from a previously started command.
 
     Reads accumulated output from memory (hidden mode) or file (visible mode).
     Useful for polling during long-running commands after calling execute_command.
 
+    **Auto process_id detection:** If `process_id` is not provided, this tool automatically
+    detects the most recently started process from the registry or history. The inferred
+    process_id is returned in the response.
+
+    **Blocking wait mode:** When `wait_for_completion=True`, this tool will block and wait
+    for the process to complete (up to `timeout` seconds). It polls every second to check
+    if the process has finished. If the process completes before the timeout, it returns
+    immediately with the final output. If the timeout is reached, it returns the latest
+    captured output with a status indicating the process is still running.
+
     For visible processes, this reads from the tee/Tee-Object output file.
     Returns is_complete=True and status='completed' if the process has finished,
     or is_complete=False and status='running' if still active.
 
     Args:
-        process_id: The UUID from execute_command. Required.
+        process_id: Optional. The UUID from execute_command. If not provided, the most
+                    recently started process will be used automatically.
         wait_time: Recommended wait time in seconds between polling calls. Default: 4
         tail: Number of lines to return from the end of output.
               - None (default) → uses the server-wide default (20 lines).
@@ -1534,24 +1621,181 @@ def get_command_output(
               - 0 → returns full stdout and stderr (no filtering)
               - 10 → returns only the last 10 lines of stdout and stderr
               - 20 → returns only the last 20 lines of stdout and stderr
+        wait_for_completion: If True, block and wait for the process to complete (up to timeout).
+                            This eliminates the need for the separate wait_for_process tool.
+                            Default: False
+        timeout: Maximum seconds to wait when wait_for_completion=True. Default: 10
+                If the process completes within this time, returns immediately with final output.
+                If timeout is reached, returns latest output with status='running'.
 
     Returns:
         A dictionary with accumulated stdout, stderr, is_complete, status, and metadata.
+        Includes 'inferred_process_id' if process_id was auto-detected.
         When tail > 0, stdout and stderr contain only the last N lines each.
         Includes 'output_summary' with total_lines, returned_lines, and lines_omitted counts.
+        When wait_for_completion=True, includes 'waited_seconds' and 'completed_within_timeout'.
     """
     # Resolve tail: None → use server default; 0 → return all; >0 → return last N
     if tail is None:
         tail = _DEFAULT_TAIL_LINES
-    if not process_id:
-        return {
-            "stdout": "",
-            "stderr": "",
-            "success": False,
-            "is_complete": False,
-            "message": "'process_id' must be provided.",
-        }
 
+    # Auto-detect process_id if not provided
+    inferred_process_id = None
+    if not process_id:
+        process_id = _get_latest_process_id()
+        if process_id is None:
+            return {
+                "stdout": "",
+                "stderr": "",
+                "success": False,
+                "is_complete": False,
+                "message": "No running or completed processes found. Run execute_command first.",
+            }
+        inferred_process_id = process_id
+
+    # Handle wait_for_completion mode
+    if wait_for_completion:
+        start_wait = time.time()
+        poll_interval = 0.5  # Check every 500ms for responsiveness
+
+        while (time.time() - start_wait) < timeout:
+            # Check registry first
+            if process_id in _process_registry:
+                entry = _process_registry[process_id]
+                process = entry["process"]
+                poll_result = process.poll()
+
+                if poll_result is not None:
+                    # Process completed - get final output
+                    stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
+                    stdout_result, stdout_total, stdout_returned = _apply_tail(stdout_from_mem if stdout_from_mem else '', tail)
+                    stderr_result, stderr_total, stderr_returned = _apply_tail(stderr_from_mem if stderr_from_mem else '', tail)
+                    waited = round(time.time() - start_wait, 2)
+                    return {
+                        "process_id": process_id,
+                        "inferred_process_id": inferred_process_id,
+                        "stdout": stdout_result,
+                        "stderr": stderr_result,
+                        "success": (poll_result == 0),
+                        "is_complete": True,
+                        "status": "completed" if poll_result == 0 else "failed",
+                        "return_code": poll_result,
+                        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "recommended_wait_time": 0,
+                        "waited_seconds": waited,
+                        "completed_within_timeout": True,
+                        "output_summary": {
+                            "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+                            "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+                        },
+                    }
+
+                # Process still running - sleep and check again
+                time.sleep(poll_interval)
+                continue
+            elif process_id in [e.get("process_id") for e in _process_history]:
+                # Process completed and moved to history
+                for entry in _process_history:
+                    if entry.get("process_id") == process_id:
+                        stdout = entry.get("stdout", "")
+                        stderr = entry.get("stderr", "")
+                        stdout_result, stdout_total, stdout_returned = _apply_tail(stdout, tail)
+                        stderr_result, stderr_total, stderr_returned = _apply_tail(stderr, tail)
+                        waited = round(time.time() - start_wait, 2)
+                        return {
+                            "process_id": process_id,
+                            "inferred_process_id": inferred_process_id,
+                            "stdout": stdout_result,
+                            "stderr": stderr_result,
+                            "success": entry.get("return_code") == 0,
+                            "is_complete": True,
+                            "status": "completed" if entry.get("return_code") == 0 else "failed",
+                            "return_code": entry.get("return_code"),
+                            "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "recommended_wait_time": 0,
+                            "waited_seconds": waited,
+                            "completed_within_timeout": True,
+                            "output_summary": {
+                                "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+                                "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+                            },
+                        }
+            else:
+                # Process not found in registry or history - it may have been cleaned up
+                waited = round(time.time() - start_wait, 2)
+                return {
+                    "process_id": process_id,
+                    "inferred_process_id": inferred_process_id,
+                    "stdout": "",
+                    "stderr": "",
+                    "success": None,
+                    "is_complete": True,
+                    "status": "not_found",
+                    "message": "Process was removed from registry (may have completed and been cleaned up).",
+                    "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "recommended_wait_time": 0,
+                    "waited_seconds": waited,
+                    "completed_within_timeout": False,
+                    "output_summary": {"stdout": {"total_lines": 0, "returned_lines": 0, "lines_omitted": 0}, "stderr": {"total_lines": 0, "returned_lines": 0, "lines_omitted": 0}},
+                }
+
+        # Timeout reached - return latest output
+        if process_id in _process_registry:
+            entry = _process_registry[process_id]
+            process = entry["process"]
+            poll_result = process.poll()
+
+            if poll_result is not None:
+                # Process completed just as we checked timeout
+                stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
+                stdout_result, stdout_total, stdout_returned = _apply_tail(stdout_from_mem if stdout_from_mem else '', tail)
+                stderr_result, stderr_total, stderr_returned = _apply_tail(stderr_from_mem if stderr_from_mem else '', tail)
+                waited = round(time.time() - start_wait, 2)
+                return {
+                    "process_id": process_id,
+                    "inferred_process_id": inferred_process_id,
+                    "stdout": stdout_result,
+                    "stderr": stderr_result,
+                    "success": (poll_result == 0),
+                    "is_complete": True,
+                    "status": "completed" if poll_result == 0 else "failed",
+                    "return_code": poll_result,
+                    "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "recommended_wait_time": 0,
+                    "waited_seconds": waited,
+                    "completed_within_timeout": True,
+                    "output_summary": {
+                        "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+                        "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+                    },
+                }
+
+            # Process still running - return latest output
+            stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
+            stdout_result, stdout_total, stdout_returned = _apply_tail(stdout_from_mem if stdout_from_mem else '', tail)
+            stderr_result, stderr_total, stderr_returned = _apply_tail(stderr_from_mem if stderr_from_mem else '', tail)
+            waited = round(time.time() - start_wait, 2)
+            return {
+                "process_id": process_id,
+                "inferred_process_id": inferred_process_id,
+                "stdout": stdout_result,
+                "stderr": stderr_result,
+                "success": None,
+                "is_complete": False,
+                "status": "running",
+                "return_code": None,
+                "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "recommended_wait_time": wait_time,
+                "waited_seconds": waited,
+                "completed_within_timeout": False,
+                "message": "Timeout reached. Process is still running. Use get_command_output again to check for updates.",
+                "output_summary": {
+                    "stdout": {"total_lines": stdout_total, "returned_lines": stdout_returned, "lines_omitted": stdout_total - stdout_returned},
+                    "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
+                },
+            }
+
+    # Normal polling mode (no wait_for_completion)
     if process_id not in _process_registry:
         # Check history for completed processes
         for entry in _process_history:
@@ -1562,6 +1806,7 @@ def get_command_output(
                 stderr_result, stderr_total, stderr_returned = _apply_tail(stderr, tail)
                 return {
                     "process_id": process_id,
+                    "inferred_process_id": inferred_process_id,
                     "stdout": stdout_result,
                     "stderr": stderr_result,
                     "success": entry.get("return_code") == 0,
@@ -1577,6 +1822,7 @@ def get_command_output(
                 }
         return {
             "process_id": process_id,
+            "inferred_process_id": inferred_process_id,
             "stdout": "",
             "stderr": "",
             "success": False,
@@ -1602,6 +1848,7 @@ def get_command_output(
 
     return {
         "process_id": process_id,
+        "inferred_process_id": inferred_process_id,
         "stdout": stdout_result,
         "stderr": stderr_result,
         "success": (poll_result == 0) if is_complete else None,
@@ -1865,6 +2112,52 @@ def wait_for_process(process_id: str = None, wait_time: int = 10) -> dict:
             "waited_seconds": actual_waited,
             "message": f"Waited {actual_waited} seconds.",
         }
+
+
+@mcp.tool()
+def execute_command_with_terminal(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4, show_output: bool = False) -> dict:
+    """Execute a command in a visible terminal window.
+
+    This tool is specifically designed for commands that require user interaction,
+    such as `sudo` commands that prompt for a password, interactive configuration tools,
+    or any command that needs a visible terminal for input/output.
+
+    Unlike `execute_command`, this tool always runs in a visible terminal window
+    (`visible=True`), allowing the user to see the terminal and interact with prompts.
+
+    When `visible=True` on Linux, the command is wrapped with `tee` to capture output
+    to a file while displaying it in the terminal. On Windows, PowerShell Tee-Object
+    is used. On macOS, Terminal.app is launched with tee capture.
+
+    If no visible terminal is available (e.g., headless Linux without DISPLAY),
+    the command falls back to hidden mode.
+
+    Args:
+        command: The command to execute.
+        working_dir: The working directory to execute the command in. Default: current directory
+        timeout: Maximum execution time in seconds for the process itself. Default: 300
+        wait_time: Recommended wait time in seconds between polling calls. Default: 4
+        show_output: If True, include a preview of the first 50 lines of captured output.
+                     Default: False
+
+    Returns:
+        A dictionary with process_id, return code, execution time, and output info.
+        Includes 'visible': True if the terminal was actually opened.
+        For interactive commands, use get_command_output with the returned process_id
+        to check progress, or wait for the process to complete.
+
+    Example:
+        # For sudo commands that need password input
+        execute_command_with_terminal("sudo apt update")
+    """
+    return execute_command(
+        command=command,
+        working_dir=working_dir,
+        timeout=timeout,
+        wait_time=wait_time,
+        visible=True,  # Always visible for interactive commands
+        show_output=show_output,
+    )
 
 
 @mcp.tool()

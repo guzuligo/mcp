@@ -460,6 +460,14 @@ def _monitor_visible(pid, ofile):
                       "start_time": e.get("start_time"), "end_time": time.time(), "stdout": so, "stderr": se})
     except Exception: pass
 
+def _get_latest_process_id():
+    """Get the process_id of the most recently started process from registry or history."""
+    if _process_registry:
+        return next(reversed(_process_registry))
+    if _process_history:
+        return _process_history[0].get("process_id")
+    return None
+
 def _make_response(cmd, wd, pid, ofile, proc, start_time, wait_time, visible, show_output, extra_err=None):
     """Build a unified response dict for execute_command."""
     end, et = time.time(), time.time() - start_time
@@ -488,10 +496,12 @@ def _make_response(cmd, wd, pid, ofile, proc, start_time, wait_time, visible, sh
 
 @mcp.tool()
 def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4,
-                    visible: bool = True, show_output: bool = False) -> dict:
+                    visible: bool = False, show_output: bool = False) -> dict:
     """Execute a shell command asynchronously. Returns process_id for use with get_command_output(), check_progress(), kill_process().
-       Args: command, working_dir, timeout (default 300), wait_time (default 4), visible (default True), show_output (default False).
-       Returns: {command, working_dir, process_id, output_file, return_code, stdout, stderr, success, is_complete, execution_time_seconds, recommended_wait_time, visible, show_output, output_summary}."""
+       By default, commands run in hidden mode (no terminal window). Use visible=True for interactive GUI apps.
+       For fast commands, returns full output immediately with "instant_feedback": True.
+       Args: command, working_dir, timeout (default 300), wait_time (default 4), visible (default False), show_output (default False).
+       Returns: {command, working_dir, process_id, output_file, return_code, stdout, stderr, success, is_complete, execution_time_seconds, recommended_wait_time, visible, show_output, instant_feedback, output_summary}."""
     start_time = time.time()
     pid = str(uuid.uuid4())
     ofile = f"/tmp/mcp_cmd_output_{pid}.txt"
@@ -518,10 +528,36 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
                         if l == '': break
                         _process_registry[pid][key + "_chunks"].append(l)
                 except Exception: pass
-            threading.Thread(target=reader, args=("", "stdout"), daemon=True).start()
-            threading.Thread(target=reader, args=("", "stderr"), daemon=True).start()
+            _stdout_thread = threading.Thread(target=reader, args=("", "stdout"), daemon=True)
+            _stderr_thread = threading.Thread(target=reader, args=("", "stderr"), daemon=True)
+            _stdout_thread.start()
+            _stderr_thread.start()
         else:
             threading.Thread(target=_monitor_visible, args=(pid, ofile), daemon=True).start()
+
+        # Instant feedback for fast commands: wait briefly and check if complete
+        if not use_visible:
+            time.sleep(0.1)
+            pr = proc.poll()
+            if pr is not None:
+                _stdout_thread.join(timeout=1.0)
+                _stderr_thread.join(timeout=1.0)
+                so = ''.join(_process_registry[pid].get("stdout_chunks", []))
+                se = ''.join(_process_registry[pid].get("stderr_chunks", []))
+                _add_history({"process_id": pid, "command": command, "return_code": pr,
+                              "start_time": start_time, "end_time": time.time(), "stdout": so, "stderr": se})
+                del _process_registry[pid]
+                et = time.time() - start_time
+                sp, st, sr = _tail(so, 50)
+                ep, et2, er = _tail(se, 50)
+                return {"command": command, "working_dir": os.path.abspath(working_dir), "process_id": pid,
+                        "output_file": ofile, "return_code": pr, "stdout": sp, "stderr": ep,
+                        "success": (pr == 0), "is_complete": True,
+                        "execution_time_seconds": round(et, 3), "recommended_wait_time": 0,
+                        "visible": False, "show_output": show_output, "instant_feedback": True,
+                        "output_summary": {"stdout": {"total_lines": st, "returned_lines": sr, "lines_omitted": st - sr},
+                                           "stderr": {"total_lines": et2, "returned_lines": er, "lines_omitted": et2 - er}}}
+
         return _make_response(command, working_dir, pid, ofile, proc, start_time, wait_time, use_visible, show_output)
     except subprocess.TimeoutExpired:
         try: proc.kill()
@@ -533,16 +569,97 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
                               {"stderr": f"Error executing command: {e}"})
 
 @mcp.tool()
-def get_command_output(process_id: str, wait_time: int = 4, tail: int = None) -> dict:
-    """Get output from a previously started command. Args: process_id (required), wait_time (default 4), tail (default from MCP_DEFAULT_TAIL_LINES env var). Returns: {process_id, stdout, stderr, success, is_complete, status, return_code, last_updated, recommended_wait_time, output_summary, message}."""
+def get_command_output(process_id: str = None, wait_time: int = 4, tail: int = None,
+                       wait_for_completion: bool = False, timeout: int = 10) -> dict:
+    """Get output from a previously started command.
+       Auto process_id: If not provided, uses the most recent process from registry/history.
+       wait_for_completion=True: Blocks until process finishes (up to timeout seconds).
+       Args: process_id (optional), wait_time (default 4), tail (default from env), wait_for_completion (default False), timeout (default 10).
+       Returns: {process_id, inferred_process_id, stdout, stderr, success, is_complete, status, return_code, last_updated, recommended_wait_time, output_summary, message, waited_seconds, completed_within_timeout}."""
     tail = tail if tail is not None else _DEFAULT_TAIL_LINES
+    inferred = None
     if not process_id:
-        return {"stdout": "", "stderr": "", "success": False, "is_complete": False, "message": "'process_id' must be provided."}
+        process_id = _get_latest_process_id()
+        if process_id is None:
+            return {"stdout": "", "stderr": "", "success": False, "is_complete": False,
+                    "message": "No running or completed processes found. Run execute_command first."}
+        inferred = process_id
+
+    # Blocking wait mode
+    if wait_for_completion:
+        start_wait = time.time()
+        while (time.time() - start_wait) < timeout:
+            if process_id in _process_registry:
+                e = _process_registry[process_id]
+                pr = e["process"].poll()
+                if pr is not None:
+                    so, se = _get_output(process_id)
+                    sr, st, srt = _tail(so, tail); er, et, ert = _tail(se, tail)
+                    w = round(time.time() - start_wait, 2)
+                    return {"process_id": process_id, "inferred_process_id": inferred, "stdout": sr, "stderr": er,
+                            "success": (pr == 0), "is_complete": True,
+                            "status": "completed" if pr == 0 else "failed",
+                            "return_code": pr, "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "recommended_wait_time": 0, "waited_seconds": w, "completed_within_timeout": True,
+                            "output_summary": {"stdout": {"total_lines": st, "returned_lines": srt, "lines_omitted": st - srt},
+                                               "stderr": {"total_lines": et, "returned_lines": ert, "lines_omitted": et - ert}}}
+                time.sleep(0.5)
+                continue
+            elif any(e.get("process_id") == process_id for e in _process_history):
+                for e in _process_history:
+                    if e.get("process_id") == process_id:
+                        so, se = e.get("stdout", ""), e.get("stderr", "")
+                        sr, st, srt = _tail(so, tail); er, et, ert = _tail(se, tail)
+                        w = round(time.time() - start_wait, 2)
+                        return {"process_id": process_id, "inferred_process_id": inferred, "stdout": sr, "stderr": er,
+                                "success": e.get("return_code") == 0, "is_complete": True,
+                                "status": "completed" if e.get("return_code") == 0 else "failed",
+                                "return_code": e.get("return_code"),
+                                "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "recommended_wait_time": 0, "waited_seconds": w, "completed_within_timeout": True,
+                                "output_summary": {"stdout": {"total_lines": st, "returned_lines": srt, "lines_omitted": st - srt},
+                                                   "stderr": {"total_lines": et, "returned_lines": ert, "lines_omitted": et - ert}}}
+            else:
+                w = round(time.time() - start_wait, 2)
+                return {"process_id": process_id, "inferred_process_id": inferred, "stdout": "", "stderr": "",
+                        "success": None, "is_complete": True, "status": "not_found",
+                        "message": "Process was removed from registry.",
+                        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "recommended_wait_time": 0, "waited_seconds": w, "completed_within_timeout": False,
+                        "output_summary": {"stdout": {"total_lines": 0, "returned_lines": 0, "lines_omitted": 0},
+                                           "stderr": {"total_lines": 0, "returned_lines": 0, "lines_omitted": 0}}}
+        # Timeout reached
+        if process_id in _process_registry:
+            e = _process_registry[process_id]
+            pr = e["process"].poll()
+            if pr is not None:
+                so, se = _get_output(process_id)
+                sr, st, srt = _tail(so, tail); er, et, ert = _tail(se, tail)
+                w = round(time.time() - start_wait, 2)
+                return {"process_id": process_id, "inferred_process_id": inferred, "stdout": sr, "stderr": er,
+                        "success": (pr == 0), "is_complete": True,
+                        "status": "completed" if pr == 0 else "failed",
+                        "return_code": pr, "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "recommended_wait_time": 0, "waited_seconds": w, "completed_within_timeout": True,
+                        "output_summary": {"stdout": {"total_lines": st, "returned_lines": srt, "lines_omitted": st - srt},
+                                           "stderr": {"total_lines": et, "returned_lines": ert, "lines_omitted": et - ert}}}
+            so, se = _get_output(process_id)
+            sr, st, srt = _tail(so, tail); er, et, ert = _tail(se, tail)
+            w = round(time.time() - start_wait, 2)
+            return {"process_id": process_id, "inferred_process_id": inferred, "stdout": sr, "stderr": er,
+                    "success": None, "is_complete": False, "status": "running",
+                    "return_code": None, "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "recommended_wait_time": wait_time, "waited_seconds": w, "completed_within_timeout": False,
+                    "message": "Timeout reached. Process still running.",
+                    "output_summary": {"stdout": {"total_lines": st, "returned_lines": srt, "lines_omitted": st - srt},
+                                       "stderr": {"total_lines": et, "returned_lines": ert, "lines_omitted": et - ert}}}
+
+    # Normal polling mode
     for e in _process_history:
         if e["process_id"] == process_id:
             so, se = e.get("stdout", ""), e.get("stderr", "")
             sr, st, srt = _tail(so, tail); er, et, ert = _tail(se, tail)
-            return {"process_id": process_id, "stdout": sr, "stderr": er,
+            return {"process_id": process_id, "inferred_process_id": inferred, "stdout": sr, "stderr": er,
                     "success": e.get("return_code") == 0, "is_complete": True,
                     "status": "completed" if e.get("return_code") == 0 else "failed",
                     "return_code": e.get("return_code"), "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -550,13 +667,14 @@ def get_command_output(process_id: str, wait_time: int = 4, tail: int = None) ->
                     "output_summary": {"stdout": {"total_lines": st, "returned_lines": srt, "lines_omitted": st - srt},
                                        "stderr": {"total_lines": et, "returned_lines": ert, "lines_omitted": et - ert}}}
     if process_id not in _process_registry:
-        return {"process_id": process_id, "stdout": "", "stderr": "", "success": False, "is_complete": True,
-                "status": "not_found", "message": f"Process '{process_id}' not found.",
+        return {"process_id": process_id, "inferred_process_id": inferred, "stdout": "", "stderr": "",
+                "success": False, "is_complete": True, "status": "not_found",
+                "message": f"Process '{process_id}' not found.",
                 "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "recommended_wait_time": wait_time}
     e, proc, pr = _process_registry[process_id], _process_registry[process_id]["process"], _process_registry[process_id]["process"].poll()
     ic = pr is not None; so, se = _get_output(process_id)
     sr, st, srt = _tail(so, tail); er, et, ert = _tail(se, tail)
-    return {"process_id": process_id, "stdout": sr, "stderr": er,
+    return {"process_id": process_id, "inferred_process_id": inferred, "stdout": sr, "stderr": er,
             "success": (pr == 0) if ic else None, "is_complete": ic,
             "status": "completed" if (ic and pr == 0) else ("failed" if ic and pr is not None else "running"),
             "return_code": pr if ic else None, "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -641,6 +759,17 @@ def wait_for_process(process_id: str = None, wait_time: int = 10) -> dict:
     time.sleep(wait_time)
     return {"status": "success", "waited_seconds": round(time.time() - start, 2),
             "message": f"Waited {round(time.time() - start, 2)} seconds."}
+
+@mcp.tool()
+def execute_command_with_terminal(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4, show_output: bool = False) -> dict:
+    """Execute a command in a visible terminal window.
+       For sudo commands and interactive prompts that require user input.
+       Always runs with visible=True. Falls back to hidden mode if no display available.
+       Args: command, working_dir, timeout (default 300), wait_time (default 4), show_output (default False).
+       Returns: Same as execute_command with visible=True."""
+    return execute_command(command=command, working_dir=working_dir, timeout=timeout,
+                           wait_time=wait_time, visible=True, show_output=show_output)
+
 
 @mcp.tool()
 def git_init(path: str, overwrite: bool = False) -> dict:
