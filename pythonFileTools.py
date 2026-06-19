@@ -427,11 +427,17 @@ def read_file_content(
 ) -> dict:
     """Read and return the content of a file (similar to cat in command line).
 
+    ⚠️ IMPORTANT - Common Pitfalls:
+      - REQUIRED: `path` must be provided and must be an absolute path within your home directory (/home/user1/...).
+      - Paths outside your home directory are blocked for security. Use full absolute paths.
+      - Line numbers are 1-based (line 1 is the first line, not line 0).
+      - Always verify the file exists before editing — use this tool first, then `edit_file`.
+
     Supports reading the entire file or a specific range of lines.
     When line ranges are provided, only that portion is returned.
 
     Args:
-        path: The file path (relative to home directory). Only paths within the home directory are allowed.
+        path: REQUIRED. The absolute file path (within home directory). Only paths within the home directory are allowed.
         start_line: Optional 1-based line number to start reading from (inclusive). Default: first line.
         end_line: Optional 1-based line number to stop reading at (inclusive). Default: last line.
         encoding: The file encoding to use. Default: utf-8
@@ -487,24 +493,33 @@ def edit_file(
 ) -> dict:
     """Apply edits to a file directly and commit the change to git (for undo capability).
 
+    ⚠️ IMPORTANT - Common Pitfalls:
+      - REQUIRED: Both `path` and `changes` must be provided. `path` must be an absolute path within your home directory.
+      - REQUIRED: `changes` must be a JSON array `[...]` containing at least one change object.
+      - Each change object requires: `mode` (string), `search` (string), `replace` (string).
+      - The file must exist and reside in a git-initialized directory. If no git repo exists, run `git_init` first.
+      - Always use `read_file` first to verify the exact content you're searching for — typos in `search` cause "not found" errors.
+      - `git_dir` is OPTIONAL: Only provide it when the file is in a subdirectory of the git repo root.
+
     Returns the applied changes as a diff. Each edit is committed to git so it can be undone later.
 
-    Supports four search modes specified per change object via the 'mode` field (defaults to 'exact'):
+    Supports four search modes specified per change object via the 'mode' field (defaults to 'exact'):
       1. 'exact'   - Standard exact string matching (default). Uses `search` and `replace` fields.
       2. 'whitespace_tolerant' - Ignores differences in whitespace (spaces, tabs, newlines).
                                   Normalizes all whitespace sequences to a single space for comparison.
       3. 'regex'   - Treats the search string as a regular expression pattern.
                       Supports back-references in replace via \\1, \\2, etc.
       4. 'line_range' - Operates on line number ranges instead of text content.
+                         Requires: `start_line`, `end_line`, `replacement_content` fields.
 
     Args:
-        path: The file path (relative to home directory). Only paths within the home directory are allowed.
-        changes: A list of dictionaries describing each edit operation. See mode descriptions above.
+        path: REQUIRED. The absolute file path (within home directory). Only paths within the home directory are allowed.
+        changes: REQUIRED. A list (array) of dictionaries describing each edit operation. See mode descriptions above.
         encoding: The file encoding to use. Default: utf-8
-        git_dir: Optional path to the git repository root. If not specified, the file's parent directory is used. Use this when the file is in a subdirectory of the git repo.
+        git_dir: Optional path to the git repository root. If not specified, the file's parent directory is used.
 
     Returns:
-        Dictionary with path, content_changed, total_changes, applied_changes, diff, and commit_hash.
+        Dictionary with path, status ("success"/"no_changes"/"error"), content_changed, total_changes, applied_changes, diff, and commit_hash.
     """
     file_path = _validate_path(Path(path))
 
@@ -695,12 +710,18 @@ def edit_file(
 def undo_edit(path: str, steps: int = 1) -> dict:
     """Revert a file to its state before N confirmed edits using git history.
 
+    ⚠️ IMPORTANT - Common Pitfalls:
+      - REQUIRED: `path` must be an absolute path within your home directory.
+      - The file must have git history (commits from previous `edit_file` operations).
+      - If no git commits exist, use `edit_file` first to create commits, then undo.
+      - `steps` defaults to 1 — increase for reverting multiple edits.
+
     Args:
-        path: The file path to revert.
-        steps: Number of commits to go back. Default: 1
+        path: REQUIRED. The absolute file path to revert (within home directory).
+        steps: Number of git commits to go back. Default: 1
 
     Returns:
-        Dictionary with status, steps_reverted, and new commit hash.
+        Dictionary with path, status ("undone"/"error"), steps_reverted, and commit_hash.
     """
     file_path = _validate_path(Path(path))
     path_str = str(file_path)
@@ -885,28 +906,26 @@ def create_file(
 ) -> dict:
     """Create a new file with the given content and commit to git for undo capability.
 
+    ⚠️ IMPORTANT - Common Pitfalls:
+      - REQUIRED: Both `path` and `content` must be provided. `path` must be an absolute path within your home directory.
+      - The parent directory MUST exist. Use `list_folder` to verify, or `git_init` on the parent directory first.
+      - A git repository MUST exist in the file's directory or its ancestors. Run `git_init` first if needed.
+      - If the file already exists, set `overwrite: true` to replace it — otherwise you get an error.
+
     Note that this tool can't be used in folders where no git is initialized.
     It checks if git repository exists before creating the file. If the file already exists
     and overwrite is False, returns an error. The file is written to disk and committed to git
     so it can be undone later.
 
-    Supports four search modes specified per change object via the 'mode` field (defaults to 'exact'):
-      1. 'exact'   - Standard exact string matching (default). Uses `search` and `replace` fields.
-      2. 'whitespace_tolerant' - Ignores differences in whitespace (spaces, tabs, newlines).
-                                  Normalizes all whitespace sequences to a single space for comparison.
-      3. 'regex'   - Treats the search string as a regular expression pattern.
-                      Supports back-references in replace via \\1, \\2, etc.
-      4. 'line_range' - Operates on line number ranges instead of text content.
-
     Args:
-        path: The file path (relative to home directory). Only paths within the home directory are allowed.
-        content: The content for the new file.
+        path: REQUIRED. The absolute file path (within home directory). Parent directory must exist.
+        content: REQUIRED. The content for the new file.
         overwrite: If True, allow overwriting existing files. Default: False
         encoding: The file encoding to use. Default: utf-8
         git_dir: Optional path to the git repository root. If not specified, the file's parent directory is used.
 
     Returns:
-        Dictionary with path, content_changed, total_changes, applied_changes, diff, and commit_hash.
+        Dictionary with path, status ("success"/"overwritten"/"error"/"exists"), content_changed, and commit_hash.
     """
     file_path = _validate_path(Path(path))
 
@@ -1321,6 +1340,12 @@ def _apply_tail(text, n):
 def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4, visible: bool = False, show_output: bool = False) -> dict:
     """Execute a command and optionally show it in a visible terminal window.
 
+    ⚠️ IMPORTANT - Common Pitfalls:
+      - REQUIRED: `command` must be provided — it is the only truly required parameter.
+      - Use absolute paths for `working_dir` (e.g., "/home/user1/Documents/workspace/code/project3").
+      - For long-running commands, use the returned `process_id` with `get_command_output` to poll for results.
+      - For fast commands (ls, echo, etc.), full output is returned immediately — no need to poll.
+
     The process is tracked in a shared registry so that get_command_output can retrieve partial results
     as they arrive. This allows LM Studio to see output incrementally during long-running commands.
     Output is stored immediately in memory (not just files) so it survives temp file cleanup.
@@ -1339,22 +1364,17 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
     For long-running commands, it returns a process_id that can be used with get_command_output.
 
     Args:
-        command: The command to execute.
-        working_dir: The working directory to execute the command in. Default: current directory
+        command: REQUIRED. The shell command to execute.
+        working_dir: The working directory to execute the command in. Default: current directory (use absolute paths).
         timeout: Maximum execution time in seconds for the process itself. Default: 300
         wait_time: Recommended wait time in seconds between polling calls. Default: 4
         visible: If True, run the command in a visible terminal window. Default: False (hidden)
-        show_output: If True, include a preview of the first 50 lines of captured output in the response.
-                     Default: False (no output preview, saves tokens on initial call).
-                     Use this when you want an immediate snapshot of early output.
-                     For full or filtered output later, use get_command_output with the returned process_id.
+        show_output: If True, include a preview of the first 50 lines of captured output. Default: False
 
     Returns:
         A dictionary with process_id, return code, execution time, and optionally output preview.
         Includes output_file path for get_command_output to read progressive results.
-        Includes a 'visible' field indicating whether the terminal was actually opened.
-        When show_output=True, includes 'stdout' and 'stderr' with the first 50 lines each.
-        When the command completes instantly, includes full stdout and stderr.
+        When the command completes instantly, includes full stdout and stderr with is_complete=True.
     """
     start_time = time.time()
     process_id = str(uuid.uuid4())
@@ -2164,18 +2184,21 @@ def execute_command_with_terminal(command: str, working_dir: str = ".", timeout:
 def git_init(path: str, overwrite: bool = False) -> dict:
     """Initialize a git repository in the specified directory.
 
+    ⚠️ IMPORTANT - Common Pitfalls:
+      - REQUIRED: `path` must be an absolute path to an EXISTING directory within your home directory.
+      - Run this BEFORE `edit_file` or `create_file` if the directory has no .git folder.
+      - After initializing, you can use file editing tools — each edit will be committed for undo capability.
+      - If a git repo already exists, set `overwrite: true` to reinitialize (WARNING: removes existing .git).
+
     Creates a .git directory in the target path, making it a valid git repository.
     This is useful before using edit_file or create_file when no git repo exists yet.
 
-    If a git repository already exists at the path and overwrite is False, returns an error.
-    Set overwrite=True to reinitialize (which will remove existing .git).
-
     Args:
-        path: The directory path where the git repository should be initialized (relative to home directory).
+        path: REQUIRED. The absolute directory path where the git repository should be initialized.
         overwrite: If True, removes existing .git and reinitializes. Default: False
 
     Returns:
-        Dictionary with status, path, message indicating success or failure.
+        Dictionary with path, status ("success"/"exists"/"error"), and message.
     """
     dir_path = _validate_path(Path(path))
 

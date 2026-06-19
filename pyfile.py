@@ -22,6 +22,13 @@ TOOL QUICK REFERENCE
   wait_for_process(process_id, wait_time) → process_completed, return_code
   git_init(path, overwrite) → status, message
 
+⚠️ LLM TOOL USE REMINDERS:
+  edit_file:     REQUIRED=path (absolute) + changes=[array]. File must be in git-initialized dir. Read file first!
+  create_file:   REQUIRED=path (absolute) + content. Parent dir must exist. Git must be initialized. Set overwrite=True if exists.
+  undo_edit:     Needs git history from prior edit_file. Run git_init + edit_file first if no commits.
+  execute_cmd:   REQUIRED=command only. Use absolute paths for working_dir. Long-running: poll with process_id.
+  git_init:      REQUIRED=path (absolute to EXISTING dir). Run BEFORE edit_file/create_file if no .git.
+
 CHANGE MODES (edit_file)
   exact:          {"search": "old", "replace": "new"}
   whitespace_tolerant: {"search": "old", "replace": "new"}
