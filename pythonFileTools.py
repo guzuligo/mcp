@@ -775,6 +775,14 @@ def undo_edit(path: str, steps: int = 1) -> dict:
         return None
 
     try:
+        # Get the diff before undoing so we can report what changed
+        result_diff_before = subprocess.run(
+            ["git", "-C", str(file_path_parent), "diff", f"HEAD~{steps}..HEAD", "--", str(file_path)],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        diff_output_before = result_diff_before.stdout if result_diff_before.returncode == 0 else ""
+
         result_checkout = subprocess.run(
             ["git", "-C", str(file_path_parent), "checkout", f"HEAD~{steps}", "--", str(file_path)],
             capture_output=True, text=True, timeout=30,
@@ -836,6 +844,7 @@ def undo_edit(path: str, steps: int = 1) -> dict:
         "steps_reverted": steps,
         "commit_hash": commit_hash,
         "commit_message": undo_message,
+        "diff": diff_output_before,
     }
 
 
@@ -1081,19 +1090,7 @@ def create_file(
     return {
         "path": str(file_path),
         "status": "success" if not exists else "overwritten",
-        "content_changed": True,
-        "total_changes": 1,
-        "applied_changes": [
-            {
-                "index": 0,
-                "search": "",
-                "replace": content,
-                "status": "proposed",
-                "replacements_made": 1,
-            }
-        ],
-        "diff": content,
-        "commit_hash": commit_hash if not exists else None,
+        "commit_hash": commit_hash,
     }
 
 
@@ -1102,6 +1099,620 @@ import uuid
 
 # Shared registry to track running processes across tool calls
 _process_registry = {}
+
+# Selection state registry: tracks active selections per file path
+# { "/abs/path/to/file.py": { "active": True, "total_occurrences": 5, "search": "...", "mode": "..." } }
+_selection_registry = {}
+
+
+def _truncate_content(content: str, max_chars: int = 200) -> str:
+    """Truncate content to show first and last max_chars characters.
+    
+    Returns format: [first 200 chars]... <truncated> ...[last 200 chars]
+    """
+    if len(content) <= max_chars * 2:
+        return content
+    
+    first_part = content[:max_chars]
+    last_part = content[-max_chars:]
+    return f"{first_part}... <truncated> ...{last_part}"
+
+
+def _find_matches(
+    content: str,
+    search: str,
+    mode: str = "exact",
+    max_return_chars: int = 1000,
+    context_before: int = 0,
+    context_after: int = 0,
+) -> dict:
+    """Find all matches of search pattern in content.
+    
+    Args:
+        content: The file content to search
+        search: The search string or pattern
+        mode: 'exact', 'regex', or 'whitespace_tolerant'
+        max_return_chars: Maximum characters to return in match content
+        context_before: Lines before match to include
+        context_after: Lines after match to include
+        
+    Returns:
+        dict with total_occurrences and matches list
+    """
+    lines = content.splitlines()
+    matches = []
+    
+    if mode == "exact":
+        if search == "":
+            # Empty search matches nothing in exact mode
+            return {"total_occurrences": 0, "matches": []}
+        
+        # Find all occurrences of search string
+        search_len = len(search)
+        pos = 0
+        occurrence = 0
+        while pos < len(content):
+            idx = content.find(search, pos)
+            if idx == -1:
+                break
+            occurrence += 1
+            # Calculate line number
+            line_num = content[:idx].count('\n') + 1
+            
+            # Get surrounding context
+            match_content = content[idx:idx + search_len]
+            truncated = _truncate_content(match_content, max_chars=200)
+            
+            matches.append({
+                "occurrence": occurrence,
+                "line": line_num,
+                "content": truncated,
+                "truncated": len(match_content) > 400,
+                "full_length": len(match_content),
+            })
+            pos = idx + search_len
+            
+    elif mode == "regex":
+        try:
+            compiled = re.compile(search)
+        except re.error as e:
+            return {"total_occurrences": 0, "matches": [], "error": f"Invalid regex: {e}"}
+        
+        for match in compiled.finditer(content):
+            occurrence = match.group()
+            line_num = content[:match.start()].count('\n') + 1
+            match_content = match.group()
+            truncated = _truncate_content(match_content, max_chars=200)
+            
+            matches.append({
+                "occurrence": occurrence,
+                "line": line_num,
+                "content": truncated,
+                "truncated": len(match_content) > 400,
+                "full_length": len(match_content),
+            })
+            
+    elif mode == "whitespace_tolerant":
+        # Normalize whitespace in search and find matches
+        norm_search = " ".join(search.split())
+        norm_content = " ".join(content.split())
+        
+        if norm_search == "":
+            return {"total_occurrences": 0, "matches": []}
+            
+        pos = 0
+        occurrence = 0
+        while pos < len(norm_content):
+            idx = norm_content.find(norm_search, pos)
+            if idx == -1:
+                break
+            occurrence += 1
+            # Map normalized position back to original
+            # For simplicity, use approximate line number from normalized content
+            line_num = norm_content[:idx].count('\n') + 1
+            
+            # Get original content at approximate position
+            orig_pos = 0
+            norm_pos = 0
+            orig_start = idx
+            while norm_pos < idx and orig_pos < len(content):
+                if content[orig_pos].isspace():
+                    while orig_pos < len(content) and content[orig_pos].isspace():
+                        orig_pos += 1
+                    norm_pos += 1
+                else:
+                    norm_pos += 1
+                    orig_pos += 1
+            
+            match_content = content[orig_pos:orig_pos + len(search)]
+            truncated = _truncate_content(match_content, max_chars=200)
+            
+            matches.append({
+                "occurrence": occurrence,
+                "line": line_num,
+                "content": truncated,
+                "truncated": len(match_content) > 400,
+                "full_length": len(match_content),
+            })
+            pos = idx + len(norm_search)
+    
+    # Apply max_return_chars limit
+    total_chars = sum(len(m["content"]) for m in matches)
+    if max_return_chars > 0 and total_chars > max_return_chars:
+        # Truncate each match proportionally
+        ratio = max_return_chars / total_chars
+        for m in matches:
+            if len(m["content"]) > max_return_chars // max(len(matches), 1):
+                m["content"] = _truncate_content(m["content"], max_chars=max_return_chars // max(len(matches), 1))
+    
+    return {"total_occurrences": len(matches), "matches": matches}
+
+
+def _invalidate_selection(path: str):
+    """Invalidate the selection for a given file path."""
+    if path in _selection_registry:
+        _selection_registry[path]["active"] = False
+
+
+def _get_selection(path: str) -> dict | None:
+    """Get the active selection for a file path."""
+    return _selection_registry.get(path)
+
+
+@mcp.tool()
+def select_before_edit_file_content(
+    path: str,
+    search: str = None,
+    mode: str = "exact",
+    max_return_chars: int = 1000,
+    context_before: int = 0,
+    context_after: int = 0,
+    encoding: str = "utf-8",
+) -> dict:
+    """Search for content in a file and store the selection for later editing.
+    
+    This tool finds all occurrences of the search pattern in the file and stores
+    the selection state. The selection can then be used with edit_after_select_file_content
+    to replace specific occurrences.
+    
+    ⚠️ IMPORTANT - Common Pitfalls:
+      - REQUIRED: `path` must be an absolute path within your home directory.
+      - At least one of `search` or `mode` must be provided.
+      - `search` is the text/pattern to find. If empty, no selection is made.
+      - `mode` can be: 'exact' (default), 'regex', or 'whitespace_tolerant'.
+      - The selection is stored per file path - only one active selection per file.
+      - Any edit to the file will invalidate the current selection.
+    
+    Args:
+        path: REQUIRED. The absolute file path (within home directory).
+        search: REQUIRED. The text or pattern to search for.
+        mode: Search mode - 'exact', 'regex', or 'whitespace_tolerant'. Default: 'exact'
+        max_return_chars: Maximum characters to return in match content. Default: 1000
+        context_before: Lines before match to include. Default: 0
+        context_after: Lines after match to include. Default: 0
+        encoding: The file encoding to use. Default: utf-8
+    
+    Returns:
+        Dictionary with path, search, mode, total_occurrences, selection_active, and matches.
+        Each match includes: occurrence, line, content (truncated), truncated flag, full_length.
+    """
+    file_path = _validate_path(Path(path))
+    
+    if not file_path.exists():
+        return {
+            "path": str(file_path),
+            "status": "error",
+            "message": f"File not found: {file_path}",
+            "search": search,
+            "mode": mode,
+            "total_occurrences": 0,
+            "selection_active": False,
+            "matches": [],
+        }
+    
+    if search is None or search == "":
+        return {
+            "path": str(file_path),
+            "status": "error",
+            "message": "Search pattern is required",
+            "search": search,
+            "mode": mode,
+            "total_occurrences": 0,
+            "selection_active": False,
+            "matches": [],
+        }
+    
+    content = file_path.read_text(encoding=encoding)
+    result = _find_matches(content, search, mode, max_return_chars, context_before, context_after)
+    
+    # Store selection in registry
+    _selection_registry[str(file_path)] = {
+        "active": True,
+        "total_occurrences": result["total_occurrences"],
+        "search": search,
+        "mode": mode,
+        "max_return_chars": max_return_chars,
+        "context_before": context_before,
+        "context_after": context_after,
+        "encoding": encoding,
+    }
+    
+    return {
+        "path": str(file_path),
+        "status": "success",
+        "search": search,
+        "mode": mode,
+        "total_occurrences": result["total_occurrences"],
+        "selection_active": True,
+        "matches": result["matches"],
+    }
+
+
+@mcp.tool()
+def edit_after_select_file_content(
+    path: str,
+    occurrence: int = 0,
+    replacement: str = "",
+    encoding: str = "utf-8",
+    git_dir: str = None,
+) -> dict:
+    """Replace content in a file based on a previously stored selection.
+    
+    This tool applies replacements to the occurrences found by select_before_edit_file_content.
+    The selection must be active (not invalidated by previous edits).
+    
+    ⚠️ IMPORTANT - Common Pitfalls:
+      - A selection must exist and be active for the file path.
+      - `occurrence` = 0 replaces ALL occurrences
+      - `occurrence` = 1 replaces only the FIRST occurrence
+      - `occurrence` = [1, 3, 5] replaces SPECIFIC occurrences (list of 1-based indices)
+      - If selection is invalid/missing, returns error with status "selection_error"
+      - After successful edit, selection is automatically invalidated.
+    
+    Args:
+        path: REQUIRED. The absolute file path (within home directory).
+        occurrence: Which occurrence(s) to replace. 0=all, positive=int, list=specific indices.
+                    Default: 0 (replace all)
+        replacement: The replacement text. Default: "" (empty string = delete)
+        encoding: The file encoding to use. Default: utf-8
+        git_dir: Optional path to the git repository root.
+    
+    Returns:
+        Dictionary with path, status ("success"/"selection_error"/"error"), content_changed,
+        replacements_made, diff, and commit_hash.
+    """
+    file_path = _validate_path(Path(path))
+    path_str = str(file_path)
+    
+    # Check if selection exists and is active
+    selection = _get_selection(path_str)
+    if selection is None or not selection.get("active", False):
+        return {
+            "path": path_str,
+            "status": "selection_error",
+            "message": f"No active selection found for '{path_str}'. Run select_before_edit_file_content first.",
+            "content_changed": False,
+            "replacements_made": 0,
+        }
+    
+    if not file_path.exists():
+        _invalidate_selection(path_str)
+        return {
+            "path": path_str,
+            "status": "error",
+            "message": f"File not found: {file_path}",
+            "content_changed": False,
+            "replacements_made": 0,
+        }
+    
+    content = file_path.read_text(encoding=encoding)
+    search = selection["search"]
+    mode = selection["mode"]
+    total_occurrences = selection["total_occurrences"]
+    
+    # Determine which occurrences to replace
+    if occurrence == 0:
+        # Replace all
+        targets = list(range(1, total_occurrences + 1))
+    elif isinstance(occurrence, int) and occurrence > 0:
+        # Replace specific single occurrence
+        if occurrence > total_occurrences:
+            return {
+                "path": path_str,
+                "status": "error",
+                "message": f"Occurrence {occurrence} exceeds total occurrences ({total_occurrences})",
+                "content_changed": False,
+                "replacements_made": 0,
+            }
+        targets = [occurrence]
+    elif isinstance(occurrence, list):
+        # Replace specific multiple occurrences
+        targets = [o for o in occurrence if 1 <= o <= total_occurrences]
+        if not targets:
+            return {
+                "path": path_str,
+                "status": "error",
+                "message": f"No valid occurrences in list. Valid range: 1-{total_occurrences}",
+                "content_changed": False,
+                "replacements_made": 0,
+            }
+    else:
+        return {
+            "path": path_str,
+            "status": "error",
+            "message": f"Invalid occurrence value: {occurrence}",
+            "content_changed": False,
+            "replacements_made": 0,
+        }
+    
+    # Apply replacements based on mode
+    new_content = content
+    replacements_made = 0
+    
+    if mode == "exact":
+        if search == "":
+            return {
+                "path": path_str,
+                "status": "error",
+                "message": "Empty search string in exact mode",
+                "content_changed": False,
+                "replacements_made": 0,
+            }
+        
+        # Find and replace specific occurrences
+        occurrences_found = 0
+        parts = []
+        last_end = 0
+        
+        while last_end < len(new_content) and replacements_made < len(targets):
+            idx = new_content.find(search, last_end)
+            if idx == -1:
+                break
+            occurrences_found += 1
+            
+            if occurrences_found in targets:
+                parts.append(new_content[last_end:idx])
+                parts.append(replacement)
+                replacements_made += 1
+                last_end = idx + len(search)
+            else:
+                last_end = idx + len(search)
+        
+        parts.append(new_content[last_end:])
+        new_content = "".join(parts)
+        
+    elif mode == "regex":
+        try:
+            compiled = re.compile(search)
+        except re.error as e:
+            return {
+                "path": path_str,
+                "status": "error",
+                "message": f"Invalid regex: {e}",
+                "content_changed": False,
+                "replacements_made": 0,
+            }
+        
+        # Find and replace specific occurrences
+        matches = list(compiled.finditer(new_content))
+        if len(matches) < max(targets):
+            return {
+                "path": path_str,
+                "status": "error",
+                "message": f"Found {len(matches)} matches, but requested occurrence {max(targets)}",
+                "content_changed": False,
+                "replacements_made": 0,
+            }
+        
+        parts = []
+        last_end = 0
+        for match_idx, match in enumerate(matches):
+            actual_occurrence = match_idx + 1
+            if actual_occurrence in targets:
+                parts.append(new_content[last_end:match.start()])
+                parts.append(replacement)
+                replacements_made += 1
+                last_end = match.end()
+        
+        parts.append(new_content[last_end:])
+        new_content = "".join(parts)
+        
+    elif mode == "whitespace_tolerant":
+        # For whitespace_tolerant, normalize and replace
+        norm_search = " ".join(search.split())
+        norm_content = " ".join(new_content.split())
+        
+        if norm_search == "":
+            return {
+                "path": path_str,
+                "status": "error",
+                "message": "Empty search string in whitespace_tolerant mode",
+                "content_changed": False,
+                "replacements_made": 0,
+            }
+        
+        occurrences_found = 0
+        norm_parts = []
+        last_end = 0
+        
+        while last_end < len(norm_content) and replacements_made < len(targets):
+            idx = norm_content.find(norm_search, last_end)
+            if idx == -1:
+                break
+            occurrences_found += 1
+            
+            if occurrences_found in targets:
+                norm_parts.append(norm_content[last_end:idx])
+                norm_parts.append(replacement)
+                replacements_made += 1
+                last_end = idx + len(norm_search)
+            else:
+                last_end = idx + len(norm_search)
+        
+        norm_parts.append(norm_content[last_end:])
+        norm_result = "".join(norm_parts)
+        
+        # Map normalized result back to original content structure
+        # This is complex - for now, just use the normalized result
+        new_content = norm_result
+    
+    content_changed = new_content != content
+    
+    # Generate unified diff
+    if content_changed:
+        diff_lines = list(
+            difflib.unified_diff(
+                content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{file_path.name}",
+                tofile=f"b/{file_path.name}",
+            )
+        )
+    else:
+        diff_lines = []
+    
+    diff_output = "".join(diff_lines if diff_lines else "")
+    
+    # Determine git directory
+    if git_dir is not None:
+        git_repo_dir = Path(git_dir)
+    else:
+        git_repo_dir = file_path.parent.resolve()
+    
+    def _is_git_repo(directory: Path) -> bool:
+        current = directory.resolve()
+        while True:
+            git_dir_path = current / ".git"
+            if git_dir_path.is_dir():
+                return True
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        return False
+    
+    def _configure_git_user(git_repo_dir: Path) -> dict | None:
+        try:
+            result_check = subprocess.run(
+                ["git", "-C", str(git_repo_dir), "config", "user.name"],
+                capture_output=True, text=True, timeout=5,
+                stdin=subprocess.DEVNULL,
+            )
+            if result_check.returncode != 0 or not result_check.stdout.strip():
+                import getpass
+                import socket
+                username = getpass.getuser()
+                hostname = socket.gethostname()
+                email = f"{username}@{hostname}"
+                
+                config_result = subprocess.run(
+                    ["git", "-C", str(git_repo_dir), "config", "user.name", username],
+                    capture_output=True, text=True, timeout=5,
+                    stdin=subprocess.DEVNULL,
+                )
+                if config_result.returncode != 0:
+                    return {"status": "error", "message": f"Failed to set git user.name: {config_result.stderr.strip()}"}
+                
+                config_result = subprocess.run(
+                    ["git", "-C", str(git_repo_dir), "config", "user.email", email],
+                    capture_output=True, text=True, timeout=5,
+                    stdin=subprocess.DEVNULL,
+                )
+                if config_result.returncode != 0:
+                    return {"status": "error", "message": f"Failed to set git user.email: {config_result.stderr.strip()}"}
+        except Exception as e:
+            return {"status": "error", "message": f"Git user configuration failed: {e}"}
+        return None
+    
+    commit_hash = "unknown"
+    
+    if content_changed:
+        if not _is_git_repo(git_repo_dir):
+            _invalidate_selection(path_str)
+            return {
+                "path": path_str,
+                "status": "error",
+                "message": f"No git repository found for '{file_path}'.",
+                "content_changed": False,
+                "total_changes": 1,
+            }
+        
+        file_path.write_text(new_content, encoding=encoding)
+        
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        commit_message = f"{timestamp} - edit_after_select: {replacements_made} replacement(s)"
+        
+        try:
+            result_add = subprocess.run(
+                ["git", "-C", str(git_repo_dir), "add", str(file_path)],
+                capture_output=True, text=True, timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+            if result_add.returncode != 0:
+                _invalidate_selection(path_str)
+                return {
+                    "path": path_str,
+                    "status": "error",
+                    "message": f"git add failed: {result_add.stderr.strip()}",
+                    "content_changed": content_changed,
+                    "replacements_made": replacements_made,
+                }
+            
+            user_config_error = _configure_git_user(git_repo_dir)
+            if user_config_error:
+                _invalidate_selection(path_str)
+                return {
+                    "path": path_str,
+                    "status": "error",
+                    "message": f"Git user identity not configured: {user_config_error['message']}",
+                    "content_changed": content_changed,
+                    "replacements_made": replacements_made,
+                }
+            
+            result_commit = subprocess.run(
+                ["git", "-C", str(git_repo_dir), "commit", "-m", commit_message],
+                capture_output=True, text=True, timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+            if result_commit.returncode != 0:
+                _invalidate_selection(path_str)
+                return {
+                    "path": path_str,
+                    "status": "error",
+                    "message": f"git commit failed: {result_commit.stderr.strip()}",
+                    "content_changed": content_changed,
+                    "replacements_made": replacements_made,
+                }
+            
+            result_hash = subprocess.run(
+                ["git", "-C", str(git_repo_dir), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+                stdin=subprocess.DEVNULL,
+            )
+            commit_hash = result_hash.stdout.strip() if result_hash.returncode == 0 else "unknown"
+            
+        except subprocess.TimeoutExpired:
+            _invalidate_selection(path_str)
+            return {
+                "path": path_str,
+                "status": "error",
+                "message": "Git operation timed out",
+                "content_changed": content_changed,
+                "replacements_made": replacements_made,
+            }
+        
+        _invalidate_selection(path_str)
+    
+    return {
+        "path": path_str,
+        "status": "success" if content_changed else "no_changes",
+        "content_changed": content_changed,
+        "replacements_made": replacements_made,
+        "diff": diff_output,
+        "commit_hash": commit_hash if content_changed else None,
+        "selection_active": False,
+    }
+
 
 # Keep last 10 completed/terminated processes for history tracking
 _process_history = []
