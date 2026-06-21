@@ -199,6 +199,8 @@ SELECT id, title, summary, memory_type, related_ids, keywords, created_at, updat
 #### `update_memory(memory_id, updates)`
 Updates an existing memory record. Returns True if updated successfully.
 
+**Note:** This method REPLACES field values entirely. To append to fields instead of replacing, use the dedicated append methods below.
+
 ```sql
 UPDATE memories SET title = ?, summary = ?, ... , updated_at = ? WHERE id = ?
 ```
@@ -209,6 +211,72 @@ UPDATE memories SET title = ?, summary = ?, ... , updated_at = ? WHERE id = ?
 | updates | dict | Dictionary of fields to update (e.g., `{"title": "New Title", "memory_type": 2}`) |
 
 Valid keys for updates: `title`, `summary`, `memory_type`, `related_ids`, `keywords`
+
+#### `append_to_summary(memory_id, summary_addition, separator)`
+Appends text to an existing memory's summary field with a configurable separator.
+
+Use this to accumulate additional information about a memory over time instead of replacing the entire summary.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| memory_id | str | The unique identifier of the memory to append to |
+| summary_addition | str | Text to append to the summary |
+| separator | str | Custom separator between old and new content (default: `"\\n\\n---\\n\\n"`) |
+
+Returns: Dict with `status`, `original_summary_length`, `new_summary_length`, and `separator_used`.
+
+#### `append_to_keywords(memory_id, new_keywords)`
+Appends new keywords to an existing memory's keywords list. Duplicates are automatically filtered out.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| memory_id | str | The unique identifier of the memory to update |
+| new_keywords | list[str] | List of keyword strings to add |
+
+Returns: Dict with `status`, `added_keywords`, `added_count`, `removed_duplicates`, and `total_count`.
+
+#### `append_to_related_ids(memory_id, new_related_ids)`
+Appends new related IDs to an existing memory's related_ids list. Duplicates are automatically filtered out.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| memory_id | str | The unique identifier of the memory to update |
+| new_related_ids | list[str] | List of memory ID strings to add |
+
+Returns: Dict with `status`, `added_related_ids`, `added_count`, `removed_duplicates`, and `total_count`.
+
+#### `select_memory(memory_id, pattern, mode, start_line, end_line)`
+Selects/searches text within a memory's summary field.
+
+**Search Modes:**
+- **`"exact"`** (default): Exact string matching (case-sensitive)
+- **`"regex"`**: Regular expression pattern matching
+- **`"lines"`**: Line range selection using `start_line` and `end_line` (1-based)
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| memory_id | str | The unique identifier of the memory |
+| pattern | str | Search pattern (required for exact/regex modes) |
+| mode | str | Search mode: `"exact"`, `"regex"`, or `"lines"` |
+| start_line | int | Start line number (for "lines" mode, 1-based) |
+| end_line | int | End line number (for "lines" mode, 1-based, inclusive) |
+
+Returns: Dict with `status`, `occurrences`, `matched_text`, `truncated`, `selection_id`, and `match_positions`.
+
+**Truncation:** If matched text exceeds 500 characters, it is truncated to: `first 200 chars \n...<truncated>... last 200 chars`
+
+#### `edit_selection(selection_id, replacement, occurrence)`
+Edits text based on a previous selection. The selection is **nullified** after editing.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| selection_id | str | The selection ID returned from `select_memory` |
+| replacement | str | Text to replace matched content with |
+| occurrence | int | Which occurrence to edit: `1`=first, `2`=second, `0`=all |
+
+Returns: Dict with `status`, `changes_made`, `edits`, and `selection_nullified` flag.
+
+**Important:** After editing, the selection is nullified. You must call `select_memory` again to select new content.
 
 #### `delete_memory(memory_id)`
 Deletes a specific memory by ID. Returns True if deleted successfully.
@@ -259,7 +327,12 @@ All tools return JSON strings for MCP compatibility. Each tool function catches 
 | `get_all_keywords` | List all keywords and titles | Optional pattern filter |
 | `get_memory_stats` | View memory statistics | None |
 | `delete_memory` | Delete a memory item | memory_id |
-| `update_memory` | Update an existing memory | memory_id, updates (JSON string or dict) |
+| `update_memory` | Update an existing memory (replaces fields) | memory_id, updates (JSON string or dict) |
+| `append_to_summary` | Append text to summary with configurable separator | memory_id, summary_addition, separator (default: `"\\n\\n---\\n\\n"`) |
+| `append_to_keywords` | Add keywords without losing existing ones | memory_id, keywords (JSON string or list) |
+| `append_to_related_ids` | Add related IDs without losing existing links | memory_id, related_ids (JSON string or list) |
+| `select_memory` | Select/search text within a memory's summary | memory_id, pattern, mode (exact/regex/lines), start_line, end_line |
+| `edit_selection` | Edit previously selected text | selection_id, replacement, occurrence (1=first, 2=second, 0=all) |
 
 ## Best Practices for LLM Usage
 
@@ -272,6 +345,7 @@ All tools return JSON strings for MCP compatibility. Each tool function catches 
 - **Include specific details**: Dates, numbers, links, names, URLs, file paths - anything that wouldn't be obvious from a general reading
 - **Summarize what was learned**: The summary should capture the essence of the conversation or document
 - **Be thorough but organized**: Use paragraphs or bullet points for complex topics
+- **Use append_to_summary**: When accumulating information over time, use the append method instead of update to avoid losing context
 
 ### Memory Type Selection
 Use the appropriate type code for each memory:
@@ -300,6 +374,71 @@ Do NOT include:
 ### Related IDs Usage
 - Link related memories by their IDs to create memory graphs
 - Helps traverse connected knowledge across sessions
+- Use `append_to_related_ids` to add new connections without losing existing ones
+
+## Select and Edit Workflow
+
+The `select_memory` and `edit_selection` tools provide a two-step workflow for precise text editing within memories.
+
+### Step 1: Select Memory
+```
+select_memory(memory_id="260620174500", pattern="bug", mode="exact")
+```
+
+Returns:
+```json
+{
+  "status": "success",
+  "memory_id": "260620174500",
+  "mode": "exact",
+  "occurrences": 3,
+  "matched_text": "The bug was found...\n...<truncated>...bug in production",
+  "truncated": true,
+  "selection_id": "sel_260620174500_1",
+  "match_positions": [{"start": 42, "end": 45}, ...]
+}
+```
+
+### Step 2: Edit Selection
+```
+edit_selection(selection_id="sel_260620174500_1", replacement="error", occurrence=1)
+```
+
+- `occurrence=1`: Replace only the first "bug"
+- `occurrence=2`: Replace only the second "bug"
+- `occurrence=0`: Replace ALL occurrences
+
+**Important:** After editing, the selection is nullified. You must call `select_memory` again for further edits.
+
+## Appending vs Updating Memories
+
+### When to Use `append_*` Methods
+
+The append methods are designed for **accumulating information** over time without losing existing data:
+
+```python
+# Instead of update_memory (which replaces):
+# update_memory(memory_id, {"keywords": ["new_keyword"]})  # Loses old keywords!
+
+# Use append_to_keywords (which adds):
+append_to_keywords(memory_id, ["new_keyword"])  # Keeps old keywords + adds new
+```
+
+### Configurable Separator for Summary
+
+The `append_to_summary` method uses a configurable separator (default: `"\\n\\n---\\n\\n"`):
+
+```python
+# Default separator (horizontal rule):
+append_to_summary(memory_id, "New information here")
+# Result: "Original summary\n\n---\n\nNew information here"
+
+# Custom separator for dated entries:
+append_to_summary(memory_id, "2026-06-20: Updated info", separator="\n\n## [2026-06-20]:\n\n")
+
+# Custom separator for bullet points:
+append_to_summary(memory_id, "- New point to remember", separator="\n- ")
+```
 
 ## Details Level System
 
@@ -363,6 +502,15 @@ memory = mem.get_memory_by_id(result["id"], details_level=2)
 
 # Search across all fields
 results = mem.search(pattern="application logs", details_level=1)
+
+# Append to summary with new information
+mem.append_to_summary(result["id"], "Additional finding: The bug was caused by a race condition.")
+
+# Add new keywords without losing old ones
+mem.append_to_keywords(result["id"], ["race-condition", "bug-fix"])
+
+# Link to another related memory
+mem.append_to_related_ids(result["id"], [another_memory_id])
 
 # Get all types with counts
 all_types = mem.get_all_types()

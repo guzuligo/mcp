@@ -36,3 +36,6 @@ Thumbs.db
 *.pyc
 test_edit_file.py
 test_edit_file_pytft.py
+
+# Test files
+test_*.py

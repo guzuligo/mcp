@@ -63,6 +63,7 @@ DATABASE SCHEMA:
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -73,6 +74,13 @@ from fastmcp import FastMCP
 
 # Thread lock for thread-safe database operations
 _db_lock = threading.Lock()
+
+# Selection store: selection_id -> selection data
+# Used by select_memory/edit_selection tools
+_selection_store: Dict[str, dict] = {}
+
+# Selection ID counter for unique IDs
+_selection_counter = 0
 
 mcp = FastMCP("memorylite")
 
@@ -809,6 +817,430 @@ class MemoryLite:
             return rows_affected > 0
         finally:
             db.close()
+
+    def append_to_summary(self, memory_id: str, summary_addition: str, separator: str = "\n\n---\n\n") -> dict:
+        """Append text to an existing memory's summary field.
+
+        Args:
+            memory_id: The unique identifier of the memory to update
+            summary_addition: Text to append to the summary
+            separator: Custom separator between old and new content (default: "\\n\\n---\\n\\n")
+
+        Returns:
+            Dict with status, original_summary_length, new_summary_length, and message
+        """
+        db = self._get_connection()
+        try:
+            row = db.execute(
+                "SELECT summary, updated_at FROM memories WHERE id = ?",
+                (memory_id,)
+            ).fetchone()
+
+            if not row:
+                return {
+                    "status": "not_found",
+                    "message": f"No memory found with ID '{memory_id}'"
+                }
+
+            original_summary = row[0]
+            new_summary = original_summary + separator + summary_addition
+            timestamp = self._get_timestamp()
+
+            db.execute(
+                "UPDATE memories SET summary = ?, updated_at = ? WHERE id = ?",
+                (new_summary, timestamp, memory_id)
+            )
+            db.commit()
+
+            return {
+                "status": "success",
+                "message": f"Summary appended to memory '{memory_id}'",
+                "original_summary_length": len(original_summary),
+                "new_summary_length": len(new_summary),
+                "separator_used": repr(separator)
+            }
+        finally:
+            db.close()
+
+    def append_to_keywords(self, memory_id: str, new_keywords: List[str]) -> dict:
+        """Append new keywords to an existing memory's keywords list.
+
+        Duplicates are automatically filtered out.
+
+        Args:
+            memory_id: The unique identifier of the memory to update
+            new_keywords: List of keyword strings to add
+
+        Returns:
+            Dict with status, added_count, removed_duplicates, total_count, and message
+        """
+        db = self._get_connection()
+        try:
+            row = db.execute(
+                "SELECT keywords, updated_at FROM memories WHERE id = ?",
+                (memory_id,)
+            ).fetchone()
+
+            if not row:
+                return {
+                    "status": "not_found",
+                    "message": f"No memory found with ID '{memory_id}'"
+                }
+
+            existing_keywords = self._safe_parse_json(row[0], [])
+            new_set = set(existing_keywords)
+            added = [kw for kw in new_keywords if kw not in new_set]
+            duplicates = len(new_keywords) - len(added)
+            
+            if not added:
+                return {
+                    "status": "success",
+                    "message": f"No new keywords to add to memory '{memory_id}' (all were duplicates)",
+                    "added_count": 0,
+                    "removed_duplicates": duplicates,
+                    "total_count": len(new_set)
+                }
+
+            updated_keywords = list(new_set)
+            timestamp = self._get_timestamp()
+
+            db.execute(
+                "UPDATE memories SET keywords = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(updated_keywords), timestamp, memory_id)
+            )
+            db.commit()
+
+            return {
+                "status": "success",
+                "message": f"Added {len(added)} new keywords to memory '{memory_id}'",
+                "added_keywords": added,
+                "added_count": len(added),
+                "removed_duplicates": duplicates,
+                "total_count": len(updated_keywords)
+            }
+        finally:
+            db.close()
+
+    def append_to_related_ids(self, memory_id: str, new_related_ids: List[str]) -> dict:
+        """Append new related IDs to an existing memory's related_ids list.
+
+        Duplicates are automatically filtered out.
+
+        Args:
+            memory_id: The unique identifier of the memory to update
+            new_related_ids: List of memory ID strings to add
+
+        Returns:
+            Dict with status, added_count, removed_duplicates, total_count, and message
+        """
+        db = self._get_connection()
+        try:
+            row = db.execute(
+                "SELECT related_ids, updated_at FROM memories WHERE id = ?",
+                (memory_id,)
+            ).fetchone()
+
+            if not row:
+                return {
+                    "status": "not_found",
+                    "message": f"No memory found with ID '{memory_id}'"
+                }
+
+            existing_ids = self._safe_parse_json(row[0], [])
+            new_set = set(existing_ids)
+            added = [rid for rid in new_related_ids if rid not in new_set]
+            duplicates = len(new_related_ids) - len(added)
+
+            if not added:
+                return {
+                    "status": "success",
+                    "message": f"No new related IDs to add to memory '{memory_id}' (all were duplicates)",
+                    "added_count": 0,
+                    "removed_duplicates": duplicates,
+                    "total_count": len(new_set)
+                }
+
+            updated_ids = list(new_set)
+            timestamp = self._get_timestamp()
+
+            db.execute(
+                "UPDATE memories SET related_ids = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(updated_ids), timestamp, memory_id)
+            )
+            db.commit()
+
+            return {
+                "status": "success",
+                "message": f"Added {len(added)} new related IDs to memory '{memory_id}'",
+                "added_related_ids": added,
+                "added_count": len(added),
+                "removed_duplicates": duplicates,
+                "total_count": len(updated_ids)
+            }
+        finally:
+            db.close()
+
+    def select_memory(
+        self,
+        memory_id: str,
+        pattern: str = None,
+        mode: str = "exact",
+        start_line: int = None,
+        end_line: int = None
+    ) -> dict:
+        """Select/search text within a memory's summary.
+
+        Modes:
+          - "exact": Exact string matching (case-sensitive)
+          - "regex": Regular expression pattern
+          - "lines": Line range selection (1-based line numbers)
+
+        Args:
+            memory_id: The unique identifier of the memory
+            pattern: Search pattern (required for exact/regex modes)
+            mode: Search mode - "exact", "regex", or "lines"
+            start_line: Start line number (for "lines" mode, 1-based)
+            end_line: End line number (for "lines" mode, 1-based, inclusive)
+
+        Returns:
+            Dict with selection_id, occurrences, matched_text, truncated, and match positions
+        """
+        global _selection_counter
+
+        db = self._get_connection()
+        try:
+            row = db.execute(
+                "SELECT summary FROM memories WHERE id = ?",
+                (memory_id,)
+            ).fetchone()
+
+            if not row:
+                return {
+                    "status": "not_found",
+                    "message": f"No memory found with ID '{memory_id}'",
+                    "occurrences": 0,
+                    "matched_text": "",
+                    "truncated": False,
+                    "selection_id": None
+                }
+
+            summary = row[0] or ""
+            matches = []
+
+            if mode == "lines":
+                if start_line is None or end_line is None:
+                    return {
+                        "status": "error",
+                        "message": "Lines mode requires start_line and end_line parameters",
+                        "occurrences": 0,
+                        "matched_text": "",
+                        "truncated": False,
+                        "selection_id": None
+                    }
+
+                lines = summary.split("\n")
+                s_idx = max(0, start_line - 1)
+                e_idx = min(len(lines), end_line)
+
+                if s_idx >= len(lines):
+                    return {
+                        "status": "not_found",
+                        "message": f"Line range [{start_line}, {end_line}] is beyond memory content ({len(lines)} lines)",
+                        "occurrences": 0,
+                        "matched_text": "",
+                        "truncated": False,
+                        "selection_id": None
+                    }
+
+                selected_lines = lines[s_idx:e_idx]
+                matched_text = "\n".join(selected_lines)
+                matches = [{"start": 0, "end": len(matched_text)}]
+
+            elif mode == "regex":
+                if not pattern:
+                    return {
+                        "status": "error",
+                        "message": "Regex mode requires a pattern",
+                        "occurrences": 0,
+                        "matched_text": "",
+                        "truncated": False,
+                        "selection_id": None
+                    }
+                try:
+                    compiled = re.compile(pattern)
+                except re.error as e:
+                    return {
+                        "status": "error",
+                        "message": f"Invalid regex pattern: {e}",
+                        "occurrences": 0,
+                        "matched_text": "",
+                        "truncated": False,
+                        "selection_id": None
+                    }
+                matches = [{"start": m.start(), "end": m.end()} for m in compiled.finditer(summary)]
+
+            else:  # exact mode (default)
+                if not pattern:
+                    return {
+                        "status": "error",
+                        "message": "Exact mode requires a pattern",
+                        "occurrences": 0,
+                        "matched_text": "",
+                        "truncated": False,
+                        "selection_id": None
+                    }
+                idx = 0
+                while True:
+                    pos = summary.find(pattern, idx)
+                    if pos == -1:
+                        break
+                    matches.append({"start": pos, "end": pos + len(pattern)})
+                    idx = pos + 1
+
+            if not matches:
+                return {
+                    "status": "not_found",
+                    "message": "No results found",
+                    "occurrences": 0,
+                    "matched_text": "",
+                    "truncated": False,
+                    "selection_id": None
+                }
+
+            # Build combined matched text and apply truncation if > 500 chars
+            # For multiple matches, concatenate all matched portions
+            matched_portions = []
+            for m in matches:
+                matched_portions.append(summary[m["start"]:m["end"]])
+            full_matched = "\n".join(matched_portions) if len(matches) > 1 else summary[matches[0]["start"]:matches[0]["end"]]
+
+            # If single match, show the match with context (up to 200 chars before and after)
+            if len(matches) == 1:
+                m = matches[0]
+                context_before = max(0, m["start"] - 200)
+                context_after = min(len(summary), m["end"] + 200)
+                full_matched = summary[context_before:context_after]
+
+            # Apply truncation if total > 500 chars
+            truncated = False
+            if len(full_matched) > 500:
+                truncated = True
+                first_200 = full_matched[:200]
+                last_200 = full_matched[-200:]
+                removed = len(full_matched) - 400
+                full_matched = first_200 + "\n...<truncated>..." + last_200
+
+            # Generate unique selection ID
+            _selection_counter += 1
+            sel_id = f"sel_{memory_id}_{_selection_counter}"
+
+            # Store selection in global store
+            _selection_store[sel_id] = {
+                "memory_id": memory_id,
+                "mode": mode,
+                "pattern": pattern,
+                "start_line": start_line,
+                "end_line": end_line,
+                "matches": matches,
+                "summary": summary,
+                "full_matched": full_matched,
+                "truncated": truncated
+            }
+
+            return {
+                "status": "success",
+                "memory_id": memory_id,
+                "mode": mode,
+                "occurrences": len(matches),
+                "matched_text": full_matched,
+                "truncated": truncated,
+                "selection_id": sel_id,
+                "match_positions": matches
+            }
+        finally:
+            db.close()
+
+    def edit_selection(self, selection_id: str, replacement: str, occurrence: int = 1) -> dict:
+        """Edit text based on a previous selection.
+
+        Args:
+            selection_id: The selection ID from select_memory
+            replacement: Text to replace matched content with
+            occurrence: Which occurrence to edit - 1=first, 2=second, 0=all
+
+        Returns:
+            Dict with status, changes_made, and edit details
+        """
+        global _selection_store
+
+        if selection_id not in _selection_store:
+            return {
+                "status": "error",
+                "message": f"Selection '{selection_id}' not found. Please call select_memory first."
+            }
+
+        sel = _selection_store[selection_id]
+        memory_id = sel["memory_id"]
+        matches = sel["matches"]
+        summary = sel["summary"]
+        mode = sel["mode"]
+
+        # Determine which matches to edit based on occurrence parameter
+        if occurrence == 0:
+            # Replace all occurrences
+            indices_to_edit = list(range(len(matches)))
+        elif occurrence < 0 or occurrence > len(matches):
+            return {
+                "status": "error",
+                "message": f"Occurrence {occurrence} is out of range. Found {len(matches)} match(es)."
+            }
+        else:
+            # Replace specific occurrence (1-based)
+            indices_to_edit = [occurrence - 1]
+
+        if not indices_to_edit:
+            return {
+                "status": "error",
+                "message": "No matches selected for editing."
+            }
+
+        # Apply replacements in reverse order to preserve positions
+        new_summary = summary
+        edits_applied = []
+        for idx in sorted(indices_to_edit, reverse=True):
+            m = matches[idx]
+            new_summary = new_summary[:m["start"]] + replacement + new_summary[m["end"]:]
+            edits_applied.append({
+                "occurrence": idx + 1,
+                "old_text": summary[m["start"]:m["end"]],
+                "new_text": replacement,
+                "position": m
+            })
+
+        # Update database
+        db = self._get_connection()
+        try:
+            timestamp = self._get_timestamp()
+            db.execute(
+                "UPDATE memories SET summary = ?, updated_at = ? WHERE id = ?",
+                (new_summary, timestamp, memory_id)
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        # Nullify the selection (remove from store)
+        del _selection_store[selection_id]
+
+        return {
+            "status": "success",
+            "memory_id": memory_id,
+            "selection_id": selection_id,
+            "selection_nullified": True,
+            "changes_made": len(edits_applied),
+            "edits": edits_applied,
+            "message": f"Selection '{selection_id}' has been nullified. Call select_memory again to select new content."
+        }
 
     def delete_memory(self, memory_id: str) -> bool:
         """Delete a specific memory by ID."""
@@ -1637,6 +2069,218 @@ def memorylite_update_memory(
         return json.dumps({"status": "error", "message": str(e)})
 
 
+@mcp.tool
+def memorylite_append_to_summary(
+    memory_id: str = "",
+    summary_addition: str = "",
+    separator: str = "\n\n---\n\n"
+) -> str:
+    """Append text to an existing memory's summary field.
+
+    Use this to accumulate additional information about a memory over time
+    instead of replacing the entire summary.
+
+    Args:
+        memory_id: The unique identifier of the memory to append to
+        summary_addition: Text to append to the summary
+        separator: Custom separator between old and new content (default: "\\n\\n---\\n\\n").
+                   You can use any string, e.g., "\\n\\n## Update:\\n\\n" or " ||| "
+
+    Returns:
+        JSON string with status, lengths, and separator used
+    """
+    try:
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
+
+        result = mem.append_to_summary(memory_id, summary_addition, separator)
+
+        return json.dumps(result, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def memorylite_append_to_keywords(
+    memory_id: str = "",
+    keywords: Opt[Union[str, list]] = "[]"
+) -> str:
+    """Append new keywords to an existing memory's keywords list.
+
+    Use this to add semantic keywords for searching without losing existing ones.
+    Duplicates are automatically filtered out.
+
+    Args:
+        memory_id: The unique identifier of the memory to update
+        keywords: JSON array string or list of keyword strings to add
+
+    Returns:
+        JSON string with status, added keywords, and counts
+    """
+    try:
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
+
+        # Handle both string and list inputs
+        if isinstance(keywords, str):
+            keywords_list = _parse_json_list_or_fix(keywords) if keywords else []
+        else:
+            keywords_list = keywords if keywords else []
+
+        result = mem.append_to_keywords(memory_id, keywords_list)
+
+        return json.dumps(result, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def memorylite_append_to_related_ids(
+    memory_id: str = "",
+    related_ids: Opt[Union[str, list]] = "[]"
+) -> str:
+    """Append new related IDs to an existing memory's related_ids list.
+
+    Use this to link this memory to new memories without losing existing links.
+    Duplicates are automatically filtered out.
+
+    Args:
+        memory_id: The unique identifier of the memory to update
+        related_ids: JSON array string or list of memory ID strings to add
+
+    Returns:
+        JSON string with status, added IDs, and counts
+    """
+    try:
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
+
+        # Handle both string and list inputs
+        if isinstance(related_ids, str):
+            related_ids_list = _parse_json_list_or_fix(related_ids) if related_ids else []
+        else:
+            related_ids_list = related_ids if related_ids else []
+
+        result = mem.append_to_related_ids(memory_id, related_ids_list)
+
+        return json.dumps(result, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def memorylite_select_memory(
+    memory_id: str = "",
+    pattern: str = "",
+    mode: str = "exact",
+    start_line: int = None,
+    end_line: int = None
+) -> str:
+    """Select/search text within a memory's summary.
+
+    Use this to find and preview text before editing it.
+    After selection, use edit_selection with the returned selection_id.
+
+    Modes:
+      - "exact" (default): Exact string matching (case-sensitive)
+      - "regex": Regular expression pattern matching
+      - "lines": Line range selection (use start_line and end_line)
+
+    Args:
+        memory_id: The unique identifier of the memory to search within
+        pattern: Search pattern (required for exact/regex modes)
+        mode: Search mode - "exact", "regex", or "lines"
+        start_line: Start line number (for "lines" mode, 1-based)
+        end_line: End line number (for "lines" mode, 1-based, inclusive)
+
+    Returns:
+        JSON string with status, occurrences, matched_text, truncated flag, and selection_id
+    """
+    try:
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
+
+        result = mem.select_memory(
+            memory_id=memory_id,
+            pattern=pattern if pattern else None,
+            mode=mode,
+            start_line=start_line,
+            end_line=end_line
+        )
+
+        return json.dumps(result, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def memorylite_edit_selection(
+    selection_id: str = "",
+    replacement: str = "",
+    occurrence: int = 1
+) -> str:
+    """Edit text based on a previous selection.
+
+    IMPORTANT: After editing, the selection is nullified. You must call
+    select_memory again to select new content for editing.
+
+    Args:
+        selection_id: The selection ID returned from select_memory
+        replacement: Text to replace the selected content with
+        occurrence: Which occurrence to edit:
+                    1 = first occurrence only
+                    2 = second occurrence only
+                    0 = replace ALL occurrences
+
+    Returns:
+        JSON string with status, changes_made, edit details, and nullification notice
+    """
+    try:
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
+
+        result = mem.edit_selection(selection_id, replacement, occurrence)
+
+        return json.dumps(result, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
 # ============================================================================
 # CLI Argument Parsing and Main Entry Point
 # ============================================================================
@@ -1696,7 +2340,12 @@ if __name__ == "__main__":
     print("  - memorylite_get_all_words: Extract all words from database with field-level breakdown (EXPENSIVE)")
     print("  - memorylite_get_memory_stats: View memory statistics")
     print("  - memorylite_delete_memory: Delete a memory item")
-    print("  - memorylite_update_memory: Update an existing memory")
+    print("  - memorylite_update_memory: Update an existing memory (replaces fields)")
+    print("  - memorylite_append_to_summary: Append text to a memory's summary (with configurable separator)")
+    print("  - memorylite_append_to_keywords: Add keywords without losing existing ones")
+    print("  - memorylite_append_to_related_ids: Add related IDs without losing existing links")
+    print("  - memorylite_select_memory: Select/search text within a memory's summary (exact, regex, or lines mode)")
+    print("  - memorylite_edit_selection: Edit previously selected text (use selection_id from select_memory)")
     print()
     print("Memory Type Codes:")
     print("  RESERVED TYPES (0-6):")
