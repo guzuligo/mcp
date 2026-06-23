@@ -106,7 +106,7 @@ async def _destroy_session(session_id: str, reason: str = ""):
             pass
 
 
-def _validate_session(session_id: str) -> dict:
+async def _validate_session(session_id: str) -> dict:
     """Check that a session exists and is not expired. Returns session dict or raises."""
     if session_id not in _sessions:
         raise ConnectionError(
@@ -383,7 +383,15 @@ async def webreader_fetch_page_section_by_id(
 
 
 @mcp.tool()
-async def webreader_browser_open(url: str, headless: bool = True) -> str:
+async def webreader_browser_open(
+    url: str,
+    headless: bool = True,
+    auth_token: Optional[str] = None,
+    auth_storage_type: str = "localStorage",
+    auth_key: str = "token",
+    auth_value: Optional[str] = None,
+    cookies: Optional[list] = None,
+) -> str:
     """Open a webpage and start an interactive browsing session.
 
     This is the ENTRY POINT for interactive browsing. It creates a persistent browser
@@ -395,28 +403,39 @@ async def webreader_browser_open(url: str, headless: bool = True) -> str:
       - User wants to fill out forms or click buttons on a webpage
       - User needs to navigate through multiple pages interactively
       - The site requires login or session-based interaction
+      - User wants to pre-authenticate the session with tokens/cookies
 
     ⚠️ You MUST call webreader_browser_open() FIRST, then use the returned session_id
     with webreader_browser_get_state, webreader_browser_click, webreader_browser_navigate, etc.
 
+    AUTHENTICATION PARAMETERS:
+      Optionally inject authentication data at session creation time.
+      This is useful for API-backed sites that require tokens in localStorage or cookies.
+
     Args:
         url: The URL to load
         headless: Run browser without UI (default: True)
+        auth_token: JWT token, API key, or bearer token (stored as auth_value)
+        auth_storage_type: Where to store the token. One of:
+                          "localStorage" (default), "sessionStorage", "cookies"
+        auth_key: Key name for localStorage/sessionStorage (default: "token")
+        auth_value: Custom value to store. If not provided, auth_token is used.
+        cookies: List of cookie dicts for direct cookie injection.
+                 Each dict: {"name": "sessionid", "value": "abc123", "domain": "example.com"}
 
     Returns:
         JSON with session_id, page title, URL, and initial content sections.
 
-    Example workflow:
-        1. webreader_browser_open("https://example.com")
-           → {"session_id": "abc123", "title": "Example", "sections": [...]}
+    Example workflow (with auth):
+        1. webreader_browser_open(
+               "https://api.example.com/dashboard",
+               auth_token="eyJhbGc...",
+               auth_storage_type="localStorage",
+               auth_key="auth_token"
+           )
+           → {"session_id": "abc123", "title": "Dashboard", ...}
         2. webreader_browser_get_state(session_id="abc123")
-           → {"sections": [...]}
-        3. webreader_browser_click(session_id="abc123", selector="#my-link")
-           → {"status": "success"}
-        4. webreader_browser_get_state(session_id="abc123")
-           → {"sections": [...]}  ← updated
-        5. webreader_browser_close(session_id="abc123")
-           → {"status": "success"}
+           → {"sections": [...]}  ← authenticated content
     """
     await _cleanup_expired_sessions()
 
@@ -427,8 +446,28 @@ async def webreader_browser_open(url: str, headless: bool = True) -> str:
     page = None
     try:
         browser = await pw.chromium.launch(headless=headless)
-        context = await browser.new_context()
+
+        # Create context with optional pre-injected cookies
+        if cookies:
+            context = await browser.new_context()
+            await context.add_cookies(cookies)
+        else:
+            context = await browser.new_context()
+
         page = await context.new_page()
+
+        # Inject localStorage/sessionStorage auth if provided
+        if auth_token and auth_storage_type != "cookies":
+            value = auth_value if auth_value is not None else auth_token
+            await page.evaluate(f"""
+                ({{key, value, storageType}}) => {{
+                    if (storageType === 'sessionStorage') {{
+                        window.sessionStorage.setItem(key, value);
+                    }} else {{
+                        window.localStorage.setItem(key, value);
+                    }}
+                }}
+            """, {"key": auth_key, "value": value, "storageType": auth_storage_type})
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
@@ -454,6 +493,13 @@ async def webreader_browser_open(url: str, headless: bool = True) -> str:
             "last_activity": datetime.now(),
         }
 
+        # Build auth info for message
+        auth_info = ""
+        if cookies and auth_storage_type == "cookies":
+            auth_info = f" Auth: {len(cookies)} cookie(s) injected. "
+        elif auth_token and auth_storage_type != "cookies":
+            auth_info = f" Auth: {auth_storage_type} key '{auth_key}' injected. "
+
         return json.dumps({
             "tool": "webreader_browser_open",
             "status": "success",
@@ -461,7 +507,7 @@ async def webreader_browser_open(url: str, headless: bool = True) -> str:
             "url": current_url,
             "title": title,
             "message": (
-                f"Session '{session_id}' created. "
+                f"Session '{session_id}' created.{auth_info}"
                 f"Use this session_id with webreader_browser_get_state, webreader_browser_click, "
                 f"webreader_browser_navigate, etc. Sessions expire after 10 minutes of inactivity."
             ),
@@ -503,7 +549,7 @@ async def webreader_browser_navigate(session_id: str, url: str) -> str:
         webreader_browser_navigate(session_id="abc123", url="https://example.com/about")
     """
     try:
-        session = _validate_session(session_id)
+        session = await _validate_session(session_id)
         page = session["page"]
 
         try:
@@ -562,7 +608,7 @@ async def webreader_browser_click(session_id: str, selector: str) -> str:
         webreader_browser_click(session_id="abc123", selector="#main-link")
     """
     try:
-        session = _validate_session(session_id)
+        session = await _validate_session(session_id)
         page = session["page"]
         # Wait for element to be visible and interactable before clicking.
         # This prevents timeouts when clicking hidden or obscured elements.
@@ -617,7 +663,7 @@ async def webreader_browser_fill(session_id: str, selector: str, value: str) -> 
         webreader_browser_fill(session_id="abc123", selector="#search-box", value="hello world")
     """
     try:
-        session = _validate_session(session_id)
+        session = await _validate_session(session_id)
         page = session["page"]
         # Wait for element to be visible and enabled before filling.
         # This prevents timeouts when the target field hasn't rendered yet.
@@ -673,7 +719,7 @@ async def webreader_browser_get_state(session_id: str) -> str:
         → {"sections": [...], "main_content_count": 3, ...}
     """
     try:
-        session = _validate_session(session_id)
+        session = await _validate_session(session_id)
         page = session["page"]
         current_url = page.url
         title = await page.title()
@@ -737,7 +783,7 @@ async def webreader_browser_go_back(session_id: str) -> str:
         webreader_browser_go_back(session_id="abc123")
     """
     try:
-        session = _validate_session(session_id)
+        session = await _validate_session(session_id)
         page = session["page"]
         try:
             await page.go_back()
@@ -783,7 +829,7 @@ async def webreader_browser_go_forward(session_id: str) -> str:
         webreader_browser_go_forward(session_id="abc123")
     """
     try:
-        session = _validate_session(session_id)
+        session = await _validate_session(session_id)
         page = session["page"]
         try:
             await page.go_forward()
@@ -823,7 +869,7 @@ async def webreader_browser_screenshot(
     fmt: str = "png",
     quality: int = 85,
     path: Optional[str] = None,
-) -> list:#str:
+) -> list:
     """Take a screenshot of the session's current page with optimized output.
 
     Resizes the browser viewport, reduces colors, and compresses the image
@@ -861,7 +907,7 @@ async def webreader_browser_screenshot(
         → Saved to file as JPEG
     """
     try:
-        session = _validate_session(session_id)
+        session = await _validate_session(session_id)
         page = session["page"]
 
         # Validate parameters
@@ -998,6 +1044,261 @@ async def webreader_browser_screenshot(
 
 
 @mcp.tool()
+async def webreader_browser_set_auth(
+    session_id: str,
+    auth_token: Optional[str] = None,
+    auth_storage_type: str = "localStorage",
+    auth_key: str = "token",
+    auth_value: Optional[str] = None,
+    cookies: Optional[list] = None,
+) -> str:
+    """Set authentication tokens/cookies in an existing browser session.
+
+    Injects authentication data into the browser session so subsequent
+    requests to APIs/websites are authenticated. Supports three methods:
+
+    1. localStorage (default): Sets window.localStorage[key] = value
+    2. sessionStorage: Sets window.sessionStorage[key] = value
+    3. cookies: Sets arbitrary cookies on the domain
+
+    WHEN TO USE:
+      - User needs to authenticate a browser session with a token
+      - User wants to inject API keys or JWT tokens into browser context
+      - User needs to set session cookies for authenticated browsing
+
+    Args:
+        session_id: The session from webreader_browser_open()
+        auth_token: JWT token, API key, or bearer token (stored as auth_value)
+        auth_storage_type: Where to store the token. One of:
+                          "localStorage" (default), "sessionStorage", "cookies"
+        auth_key: Key name for localStorage/sessionStorage (default: "token")
+        auth_value: Custom value to store. If not provided, auth_token is used.
+        cookies: List of cookie dicts for direct cookie injection.
+                 Each dict: {"name": "sessionid", "value": "abc123", "domain": "example.com"}
+
+    Returns:
+        JSON with confirmation of injected authentication.
+
+    Example:
+        # Inject JWT into localStorage
+        webreader_browser_set_auth(
+            session_id="abc123",
+            auth_token="eyJhbGc...",
+            auth_storage_type="localStorage",
+            auth_key="auth_token"
+        )
+
+        # Inject cookies
+        webreader_browser_set_auth(
+            session_id="abc123",
+            auth_storage_type="cookies",
+            cookies=[
+                {"name": "sessionid", "value": "xyz789", "url": "https://api.example.com"}
+            ]
+        )
+    """
+    try:
+        session = await _validate_session(session_id)
+        page = session["page"]
+        context = session["context"]
+
+        if auth_storage_type == "cookies" and cookies:
+            # Inject cookies directly via context
+            await context.add_cookies(cookies)
+            result = {
+                "tool": "webreader_browser_set_auth",
+                "status": "success",
+                "session_id": session_id,
+                "method": "cookies",
+                "cookies_count": len(cookies),
+                "message": f"Injected {len(cookies)} cookie(s) into session.",
+                "next_steps": [
+                    f"webreader_browser_get_state(session_id=\"{session_id}\")  — Verify authentication",
+                    f"webreader_browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Navigate to authenticated page",
+                ],
+            }
+        else:
+            # Use localStorage or sessionStorage
+            value = auth_value if auth_value is not None else (auth_token or "")
+            await page.evaluate(f"""
+                ({{key, value, storageType}}) => {{
+                    if (storageType === 'sessionStorage') {{
+                        window.sessionStorage.setItem(key, value);
+                    }} else {{
+                        window.localStorage.setItem(key, value);
+                    }}
+                }}
+            """, {"key": auth_key, "value": value, "storageType": auth_storage_type})
+
+            result = {
+                "tool": "webreader_browser_set_auth",
+                "status": "success",
+                "session_id": session_id,
+                "method": auth_storage_type,
+                "key": auth_key,
+                "message": f"Injected {auth_storage_type} key '{auth_key}' into session.",
+                "next_steps": [
+                    f"webreader_browser_get_state(session_id=\"{session_id}\")  — Verify authentication",
+                    f"webreader_browser_navigate(session_id=\"{session_id}\", url=\"...\")  — Navigate to authenticated page",
+                ],
+            }
+
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except ConnectionError as e:
+        return json.dumps({"tool": "webreader_browser_set_auth", "status": "error", "message": str(e)}, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "webreader_browser_set_auth",
+            "status": "error",
+            "session_id": session_id,
+            "message": f"Failed to set auth: {str(e)}",
+        }, indent=2)
+
+
+@mcp.tool()
+async def webreader_authenticated_api_fetch(
+    url: str,
+    method: str = "GET",
+    headers: Optional[dict] = None,
+    body: Optional[str] = None,
+    auth_type: str = "bearer",
+    auth_token: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_key_header: str = "X-API-Key",
+    timeout: int = 10,
+) -> str:
+    """Make an authenticated HTTP request to an API.
+
+    This is a STATELESS, ONE-SHOT tool for fetching data from authenticated APIs
+    without the overhead of a full browser session.
+
+    Supports multiple authentication methods:
+    - Bearer token (Authorization: Bearer <token>)
+    - API key (custom header, default: X-API-Key)
+    - Basic auth (Authorization: Basic <base64(username:password)>)
+    - Custom headers
+
+    WHEN TO USE:
+      - User needs to fetch data from a REST API that requires authentication
+      - User wants to make authenticated API calls quickly without browser overhead
+      - User needs to test API endpoints with authentication
+
+    DISTINCTION: Use this for API calls. Use webreader_browser_open() for
+    interactive browser-based authentication (e.g., login flows).
+
+    Args:
+        url: The API endpoint URL
+        method: HTTP method (GET, POST, PUT, PATCH, DELETE)
+        headers: Additional headers to send (merged with auth headers)
+        body: Request body (for POST/PUT/PATCH)
+        auth_type: Authentication type. One of:
+                   "bearer" (default), "api_key", "basic", "custom"
+        auth_token: Bearer token or API key value
+        api_key: API key value (alternative to auth_token for api_key auth)
+        api_key_header: Header name for API key (default: "X-API-Key")
+        timeout: Request timeout in seconds (default: 10)
+
+    Returns:
+        JSON with status code, headers, and response body.
+
+    Example:
+        # Bearer token
+        webreader_authenticated_api_fetch(
+            url="https://api.example.com/data",
+            auth_type="bearer",
+            auth_token="eyJhbGc..."
+        )
+
+        # API key
+        webreader_authenticated_api_fetch(
+            url="https://api.example.com/data",
+            auth_type="api_key",
+            api_key="sk-abc123",
+            api_key_header="X-API-Key"
+        )
+
+        # Basic auth
+        webreader_authenticated_api_fetch(
+            url="https://api.example.com/data",
+            auth_type="basic",
+            auth_token="username:password"
+        )
+
+        # POST with body
+        webreader_authenticated_api_fetch(
+            url="https://api.example.com/data",
+            method="POST",
+            auth_type="bearer",
+            auth_token="eyJhbGc...",
+            body=json.dumps({"key": "value"}),
+            headers={"Content-Type": "application/json"}
+        )
+    """
+    import base64
+
+    if headers is None:
+        headers = {}
+
+    # Build auth headers
+    if auth_type == "bearer" and auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    elif auth_type == "api_key":
+        key_value = api_key or auth_token
+        if key_value:
+            headers[api_key_header] = key_value
+    elif auth_type == "basic" and auth_token:
+        encoded = base64.b64encode(auth_token.encode()).decode()
+        headers["Authorization"] = f"Basic {encoded}"
+    # "custom" uses only the provided headers
+
+    # Ensure content-type for body
+    if body and "content-type" not in {k.lower() for k in headers}:
+        headers["Content-Type"] = "application/json"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.request(
+                method=method.upper(),
+                url=url,
+                headers=headers,
+                content=body,
+            )
+
+            # Try JSON first, then text
+            try:
+                response_body = resp.json()
+            except Exception:
+                response_body = resp.text[:10000]
+
+            return json.dumps({
+                "tool": "webreader_authenticated_api_fetch",
+                "status": "success",
+                "url": url,
+                "method": method.upper(),
+                "status_code": resp.status_code,
+                "headers": dict(resp.headers),
+                "body": response_body,
+                "message": f"API request completed. Status: {resp.status_code}",
+            }, indent=2, ensure_ascii=False)
+
+    except httpx.TimeoutException:
+        return json.dumps({
+            "tool": "webreader_authenticated_api_fetch",
+            "status": "error",
+            "url": url,
+            "message": f"Request timed out after {timeout} seconds",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "tool": "webreader_authenticated_api_fetch",
+            "status": "error",
+            "url": url,
+            "message": str(e),
+        }, indent=2)
+
+
+@mcp.tool()
 async def webreader_browser_close(session_id: str) -> str:
     """Close a browsing session and free resources.
 
@@ -1012,7 +1313,7 @@ async def webreader_browser_close(session_id: str) -> str:
         → {"status": "success", "message": "Session closed."}
     """
     try:
-        _validate_session(session_id)  # Check it exists
+        await _validate_session(session_id)  # Check it exists
         await _destroy_session(session_id, "user_closed")
         return json.dumps({
             "tool": "webreader_browser_close",

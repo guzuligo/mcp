@@ -901,6 +901,8 @@ class MemoryLite:
                     "total_count": len(new_set)
                 }
 
+            # Add the new keywords to the set before converting to list
+            new_set.update(added)
             updated_keywords = list(new_set)
             timestamp = self._get_timestamp()
 
@@ -960,6 +962,8 @@ class MemoryLite:
                     "total_count": len(new_set)
                 }
 
+            # Add the new related IDs to the set before converting to list
+            new_set.update(added)
             updated_ids = list(new_set)
             timestamp = self._get_timestamp()
 
@@ -1543,9 +1547,26 @@ def memorylite_save_memory(
 ) -> str:
     """Save a memory item to the database.
 
-    IMPORTANT: The 'keywords' field contains SEMANTIC KEYWORDS/PHRASES useful for SEARCHING 
-    and MATCHING related memories. These are terms the user might remember and search by later.
-    
+    USE THIS TOOL whenever you learn something worth remembering - a conversation topic, 
+    technical detail, document content, search result, or anything the user might want to 
+    recall later.
+
+    IMPORTANT - UNDERSTANDING THE FIELDS:
+      - title: A SHORT descriptive label (like a document title or email subject). Keep it concise.
+        Example: "Python Asyncio Tutorial", "Meeting with Sarah about Q4 plans"
+      
+      - summary: This is NOT just a brief summary. The summary field stores the FULL content:
+        * Complete conversation transcripts worth remembering
+        * Full document excerpts or references
+        * Detailed technical notes with all specifics
+        * Search results with all relevant information
+        * Any content where you might want to see the COMPLETE details later
+        Include EVERYTHING: dates, names, numbers, code snippets, links, quotes.
+        Think of it as a storage field for complete information, not a summary field.
+      
+      - keywords: SEMANTIC KEYWORDS/PHRASES for searching. These are terms the user might 
+        remember and search by later. Include product names, technical terms, key concepts.
+
     WHAT TO INCLUDE in keywords:
       - Product names, model numbers, technical specifications
       - Key concepts, frameworks, or methodologies mentioned
@@ -1554,27 +1575,49 @@ def memorylite_save_memory(
       - Phrases that capture the essence of what this memory is about
     
     WHAT NOT TO INCLUDE:
-      - Words already covered by 'title' or 'summary' (avoid simple duplication)
       - Generic stop words (the, a, an, for, etc.)
       - Anything too broad to be useful as a search term
-    
-    REMEMBER: This field is PRIMARY for semantic recall. Populate it with the exact words/phrases 
-    you'd use if you remembered this memory later but couldn't remember its title or summary.
 
     Args:
         title: Short descriptive title (acts as 'should I read more?' indicator)
-        summary: Detailed description with specific details (dates, numbers, links, names)
-                 Should contain specifics that won't be obvious from reading just the title.
+        summary: FULL detailed content - complete information, not a brief summary.
+                 Include all specifics: dates, numbers, links, names, code, quotes.
         memory_type: Integer type code (0-6) or type name string:
                      0=unspecified, 1=personal, 2=document, 3=reference, 4=chat, 5=chitchat, 6=technical
         related_ids: JSON array string or list of memory IDs this is related to
+                     Example: '["id1", "id2"]' or ["id1", "id2"]
         keywords: JSON array string or list of semantic keywords for lookup/searching
+                  Example: '["python", "asyncio", "tutorial"]' or ["python", "asyncio", "tutorial"]
 
     Returns:
         JSON string with the saved memory data and timestamp. Includes a warning about 
         empty keywords if not populated.
+
+    EXAMPLE USAGE:
+      # Save a technical conversation
+      memorylite_save_memory(
+          title="Python Asyncio Tutorial Notes",
+          summary="Full notes from the asyncio tutorial: asyncio.create_task() creates a task from a coroutine...",
+          memory_type="technical",
+          keywords='["python", "asyncio", "concurrency", "coroutine"]'
+      )
     """
     try:
+        # Validate required parameters
+        if not title or not title.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'title' is required and cannot be empty. Provide a short descriptive title for this memory.",
+                "hint": "Example: title='Python Asyncio Tutorial Notes'"
+            }, indent=2)
+
+        if not summary or not summary.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'summary' is required and cannot be empty. Provide the full detailed content to store.",
+                "hint": "The summary field stores complete information: dates, names, numbers, code snippets, links, quotes. Think of it as storage for full content, not a brief summary."
+            }, indent=2)
+
         mem = MemoryLite()
         mem.ensure_db_initialized()  # Ensure DB exists and is initialized
 
@@ -1610,7 +1653,11 @@ def memorylite_save_memory(
             "note": warning_note or None
         }, indent=2)
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to save memory: {str(e)}",
+            "hint": "Check that title and summary are provided and not empty."
+        }, indent=2)
 
 
 @mcp.tool
@@ -1941,29 +1988,49 @@ def memorylite_get_memory_stats() -> str:
 def memorylite_delete_memory(memory_id: str = "") -> str:
     """Delete a specific memory by ID.
 
+    USE THIS TOOL to permanently remove a memory from the database.
+    This action cannot be undone - the memory and all its data will be lost.
+
     Args:
-        memory_id: The unique identifier of the memory to delete
+        memory_id: The unique identifier of the memory to delete (e.g., "260623120000")
+                   Get valid IDs from memorylite_get_all_memories() or memorylite_search()
 
     Returns:
-        JSON string with deletion result
+        JSON string with deletion result. Status "success" if deleted, "not_found" if ID doesn't exist.
+    
+    EXAMPLE:
+        memorylite_delete_memory(memory_id="260623120000")
     """
     try:
+        # Validate memory_id parameter
+        if not memory_id or not memory_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'memory_id' is required and cannot be empty.",
+                "hint": "Get valid memory IDs from memorylite_get_all_memories() or memorylite_search()"
+            }, indent=2)
+
         mem = MemoryLite()
         success = mem.delete_memory(memory_id)
 
         return json.dumps({
             "status": "success" if success else "not_found",
-            "message": f"Memory {'deleted successfully' if success else 'not found'} with ID '{memory_id}'"
+            "message": f"Memory {'deleted successfully' if success else 'not found with ID'} with ID '{memory_id}'",
+            "deleted_id": memory_id if success else None
         }, indent=2)
     except sqlite3.OperationalError as e:
         if "unable to open database file" in str(e):
             return json.dumps({
                 "status": "error",
-                "message": "Database not yet initiated. Save a memory first."
+                "message": "Database not yet initiated. Save a memory first using memorylite_save_memory()."
             }, indent=2)
         return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to delete memory: {str(e)}",
+            "hint": "Check that memory_id is a valid format (YYMMDDhhmmss)"
+        }, indent=2)
 
 
 @mcp.tool
@@ -1971,15 +2038,57 @@ def memorylite_update_memory(
     memory_id: str = "",
     updates: Union[str, dict] = "{}"
 ) -> str:
-    """Update an existing memory.
+    """Update an existing memory's fields.
+
+    USE THIS TOOL to modify any existing memory. You can update ONE field or MULTIPLE fields at once.
+    Only the fields you specify will be changed - all other fields remain unchanged.
+
+    HOW TO USE:
+      1. First, get the memory_id using memorylite_get_all_memories() or memorylite_search()
+      2. Call this tool with the memory_id and the fields you want to change
+
+    UPDATES FORMAT (CHOOSE ONE):
+      Option A - JSON string: '{"title": "New Title", "summary": "New content"}'
+      Option B - Dict: {"title": "New Title", "summary": "New content"}
+      Both work the same way. JSON string is more common when LLMs call tools.
+
+    VALID FIELDS TO UPDATE:
+      - title: New short descriptive title
+      - summary: New full detailed content (see save_memory for what goes here)
+      - memory_type: New type code (0-6) or type name string
+      - related_ids: New list of related memory IDs (replaces existing list)
+      - keywords: New list of keywords (replaces existing list)
+
+    COMPLETE EXAMPLES:
+
+      # Update just the title
+      memorylite_update_memory(
+          memory_id="260623120000",
+          updates='{"title": "Updated Title"}'
+      )
+
+      # Update multiple fields at once
+      memorylite_update_memory(
+          memory_id="260623120000",
+          updates='{"title": "Better Title", "memory_type": "technical", "keywords": ["python", "new"]}'
+      )
+
+      # Update summary with corrected information
+      memorylite_update_memory(
+          memory_id="260623120000",
+          updates='{"summary": "Corrected detailed content here..."}'
+      )
+
+    TIP: Use memorylite_append_to_summary() to ADD content without losing existing content.
+         Use memorylite_update_memory() to REPLACE content entirely.
 
     Args:
-        memory_id: The unique identifier of the memory to update
-        updates: JSON string or dict with fields to update. Example: '{"summary": "Updated summary text"}'
-                 Valid keys are: title, summary, memory_type, related_ids, keywords
+        memory_id: The unique identifier of the memory to update (get from get_all_memories)
+        updates: JSON string or dict specifying which fields to update.
+                 Example: '{"title": "New Title", "summary": "New content"}'
 
     Returns:
-        JSON string with update result including status, message, and applied updates (with actual values)
+        JSON string with status, message, and the actual values that were applied.
     """
     try:
         mem = MemoryLite()
@@ -2000,13 +2109,34 @@ def memorylite_update_memory(
         elif isinstance(updates, str):
             try:
                 update_dict = _parse_json_dict_or_fix(updates)
+                # Check if parsing returned a non-dict (e.g., a raw string)
+                if not isinstance(update_dict, dict):
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Invalid 'updates' parameter. Expected a JSON object with fields to update (e.g., '{{'title': 'New Title'}}'). Got a non-object value.",
+                        "hint": "Use format: updates='{{\"title\": \"New Title\", \"summary\": \"New content\"}}'"
+                    }, indent=2)
             except (json.JSONDecodeError, TypeError):
                 return json.dumps({
                     "status": "error",
-                    "message": f"Invalid JSON in 'updates' parameter. Got: '{updates}'"
+                    "message": f"Failed to parse 'updates' parameter as JSON.",
+                    "hint": "Use format: updates='{{\"title\": \"New Title\"}}' or updates={{\"title\": \"New Title\"}}",
+                    "invalid_value": updates
                 }, indent=2)
         else:
             update_dict = {}
+
+        # Validate that at least one valid field is being updated
+        valid_keys = {"title", "summary", "memory_type", "related_ids", "keywords"}
+        if update_dict:
+            invalid_fields = [k for k in update_dict.keys() if k not in valid_keys]
+            if invalid_fields:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"Invalid field(s) in 'updates': {invalid_fields}",
+                    "hint": f"Valid fields are: {list(valid_keys)}",
+                    "example": '{"title": "New Title", "memory_type": "technical"}'
+                }, indent=2)
 
         # Convert string values in updates dict to proper types
         converted_updates = {}
@@ -2077,19 +2207,46 @@ def memorylite_append_to_summary(
 ) -> str:
     """Append text to an existing memory's summary field.
 
-    Use this to accumulate additional information about a memory over time
-    instead of replacing the entire summary.
+    USE THIS TOOL to ADD new information to a memory WITHOUT losing existing content.
+    Unlike update_memory (which REPLACES content), this tool APPENDS to what's already there.
+
+    USE CASES:
+      - Adding follow-up information discovered later
+      - Adding meeting notes as discussion progresses
+      - Building up a research document incrementally
 
     Args:
         memory_id: The unique identifier of the memory to append to
-        summary_addition: Text to append to the summary
+                   Get valid IDs from memorylite_get_all_memories() or memorylite_search()
+        summary_addition: Text to append to the summary (required - cannot be empty)
         separator: Custom separator between old and new content (default: "\\n\\n---\\n\\n").
                    You can use any string, e.g., "\\n\\n## Update:\\n\\n" or " ||| "
 
     Returns:
-        JSON string with status, lengths, and separator used
+        JSON string with status, original/new summary lengths, and separator used.
+
+    EXAMPLE:
+        memorylite_append_to_summary(
+            memory_id="260623120000",
+            summary_addition="Additional note: The meeting was rescheduled to Friday."
+        )
     """
     try:
+        # Validate required parameters
+        if not memory_id or not memory_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'memory_id' is required and cannot be empty.",
+                "hint": "Get valid memory IDs from memorylite_get_all_memories() or memorylite_search()"
+            }, indent=2)
+
+        if not summary_addition or not summary_addition.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'summary_addition' is required and cannot be empty.",
+                "hint": "Provide the text you want to append to the memory's summary."
+            }, indent=2)
+
         mem = MemoryLite()
         mem.ensure_db_initialized()
 
@@ -2100,11 +2257,14 @@ def memorylite_append_to_summary(
         if "unable to open database file" in str(e):
             return json.dumps({
                 "status": "error",
-                "message": "Database not yet initiated. Save a memory first."
+                "message": "Database not yet initiated. Save a memory first using memorylite_save_memory()."
             }, indent=2)
         return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to append to summary: {str(e)}"
+        }, indent=2)
 
 
 @mcp.tool
@@ -2114,25 +2274,49 @@ def memorylite_append_to_keywords(
 ) -> str:
     """Append new keywords to an existing memory's keywords list.
 
-    Use this to add semantic keywords for searching without losing existing ones.
+    USE THIS TOOL to add semantic keywords for searching WITHOUT losing existing keywords.
     Duplicates are automatically filtered out.
 
     Args:
         memory_id: The unique identifier of the memory to update
+                   Get valid IDs from memorylite_get_all_memories() or memorylite_search()
         keywords: JSON array string or list of keyword strings to add
+                  Example: '["python", "asyncio"]' or ["python", "asyncio"]
 
     Returns:
-        JSON string with status, added keywords, and counts
+        JSON string with status, added keywords, counts, and duplicates removed.
+
+    EXAMPLE:
+        memorylite_append_to_keywords(
+            memory_id="260623120000",
+            keywords='["machine-learning", "neural-networks"]'
+        )
     """
     try:
-        mem = MemoryLite()
-        mem.ensure_db_initialized()
+        # Validate required parameters
+        if not memory_id or not memory_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'memory_id' is required and cannot be empty.",
+                "hint": "Get valid memory IDs from memorylite_get_all_memories() or memorylite_search()"
+            }, indent=2)
 
         # Handle both string and list inputs
         if isinstance(keywords, str):
             keywords_list = _parse_json_list_or_fix(keywords) if keywords else []
         else:
             keywords_list = keywords if keywords else []
+
+        # Validate that at least one keyword is provided
+        if not keywords_list or (isinstance(keywords_list, list) and len(keywords_list) == 0):
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'keywords' is required and cannot be empty.",
+                "hint": "Provide a list of keywords: keywords='[\"python\", \"asyncio\"]'"
+            }, indent=2)
+
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
 
         result = mem.append_to_keywords(memory_id, keywords_list)
 
@@ -2141,11 +2325,14 @@ def memorylite_append_to_keywords(
         if "unable to open database file" in str(e):
             return json.dumps({
                 "status": "error",
-                "message": "Database not yet initiated. Save a memory first."
+                "message": "Database not yet initiated. Save a memory first using memorylite_save_memory()."
             }, indent=2)
         return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to append keywords: {str(e)}"
+        }, indent=2)
 
 
 @mcp.tool
@@ -2155,25 +2342,49 @@ def memorylite_append_to_related_ids(
 ) -> str:
     """Append new related IDs to an existing memory's related_ids list.
 
-    Use this to link this memory to new memories without losing existing links.
+    USE THIS TOOL to link this memory to other memories WITHOUT losing existing links.
     Duplicates are automatically filtered out.
 
     Args:
         memory_id: The unique identifier of the memory to update
+                   Get valid IDs from memorylite_get_all_memories() or memorylite_search()
         related_ids: JSON array string or list of memory ID strings to add
+                     Example: '["260623110000", "260623115000"]' or ["260623110000", "260623115000"]
 
     Returns:
-        JSON string with status, added IDs, and counts
+        JSON string with status, added IDs, counts, and duplicates removed.
+
+    EXAMPLE:
+        memorylite_append_to_related_ids(
+            memory_id="260623120000",
+            related_ids='["260623110000"]'
+        )
     """
     try:
-        mem = MemoryLite()
-        mem.ensure_db_initialized()
+        # Validate required parameters
+        if not memory_id or not memory_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'memory_id' is required and cannot be empty.",
+                "hint": "Get valid memory IDs from memorylite_get_all_memories() or memorylite_search()"
+            }, indent=2)
 
         # Handle both string and list inputs
         if isinstance(related_ids, str):
             related_ids_list = _parse_json_list_or_fix(related_ids) if related_ids else []
         else:
             related_ids_list = related_ids if related_ids else []
+
+        # Validate that at least one related ID is provided
+        if not related_ids_list or (isinstance(related_ids_list, list) and len(related_ids_list) == 0):
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'related_ids' is required and cannot be empty.",
+                "hint": "Provide a list of memory IDs: related_ids='[\"260623110000\"]'"
+            }, indent=2)
+
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
 
         result = mem.append_to_related_ids(memory_id, related_ids_list)
 
@@ -2182,11 +2393,14 @@ def memorylite_append_to_related_ids(
         if "unable to open database file" in str(e):
             return json.dumps({
                 "status": "error",
-                "message": "Database not yet initiated. Save a memory first."
+                "message": "Database not yet initiated. Save a memory first using memorylite_save_memory()."
             }, indent=2)
         return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to append related IDs: {str(e)}"
+        }, indent=2)
 
 
 @mcp.tool
@@ -2197,27 +2411,105 @@ def memorylite_select_memory(
     start_line: int = None,
     end_line: int = None
 ) -> str:
-    """Select/search text within a memory's summary.
+    """Select/search text within a memory's summary field.
 
-    Use this to find and preview text before editing it.
-    After selection, use edit_selection with the returned selection_id.
+    THIS IS THE FIRST STEP IN THE EDIT WORKFLOW. You must call select_memory BEFORE 
+    calling edit_selection.
 
-    Modes:
-      - "exact" (default): Exact string matching (case-sensitive)
-      - "regex": Regular expression pattern matching
-      - "lines": Line range selection (use start_line and end_line)
+    COMPLETE EDIT WORKFLOW (SELECT -> EDIT):
+      Step 1: Call select_memory to find text and get a selection_id
+      Step 2: Call edit_selection with that selection_id to make changes
+      Note: After editing, the selection_id is used up. Call select_memory again for more edits.
+
+    SEARCH MODES:
+      Mode 1 - "exact" (most common): Find exact text matches
+        Example: select_memory(memory_id="abc123", pattern="old_name", mode="exact")
+        Finds every occurrence of "old_name" in the memory's summary.
+
+      Mode 2 - "regex": Find text using regular expressions
+        Example: select_memory(memory_id="abc123", pattern=r"\\d{{4}}-\\d{{2}}-\\d{{2}}", mode="regex")
+        Finds all dates in YYYY-MM-DD format.
+
+      Mode 3 - "lines": Select specific line ranges
+        Example: select_memory(memory_id="abc123", mode="lines", start_line=5, end_line=10)
+        Selects lines 5 through 10 (1-based line numbers).
+
+    WHAT YOU GET BACK:
+      - selection_id: A unique ID you MUST use in the next step (edit_selection)
+      - occurrences: How many matches were found
+      - matched_text: A preview of the matched text (truncated if very long)
+
+    EXAMPLE WORKFLOW - Find and replace a name:
+      # Step 1: Find all occurrences of "John" in the memory
+      select_memory(memory_id="260623120000", pattern="John", mode="exact")
+      # Returns: {"selection_id": "sel_260623120000_1", "occurrences": 3, ...}
+      
+      # Step 2: Replace all 3 occurrences with "Jane"
+      edit_selection(selection_id="sel_260623120000_1", replacement="Jane", occurrence=0)
+      # occurrence=0 means replace ALL occurrences
+      # occurrence=1 means replace only the FIRST occurrence
+      # occurrence=2 means replace only the SECOND occurrence
+
+    EXAMPLE WORKFLOW - Find and replace just the first occurrence:
+      # Step 1: Find occurrences
+      select_memory(memory_id="260623120000", pattern="TODO", mode="exact")
+      # Returns: {"selection_id": "sel_260623120000_1", "occurrences": 5, ...}
+      
+      # Step 2: Replace only the first TODO
+      edit_selection(selection_id="sel_260623120000_1", replacement="DONE", occurrence=1)
 
     Args:
         memory_id: The unique identifier of the memory to search within
-        pattern: Search pattern (required for exact/regex modes)
-        mode: Search mode - "exact", "regex", or "lines"
-        start_line: Start line number (for "lines" mode, 1-based)
-        end_line: End line number (for "lines" mode, 1-based, inclusive)
+        pattern: Text to search for (required for exact/regex modes)
+        mode: Search mode - "exact" (default), "regex", or "lines"
+        start_line: Start line number (for "lines" mode only, 1-based)
+        end_line: End line number (for "lines" mode only, 1-based, inclusive)
 
     Returns:
-        JSON string with status, occurrences, matched_text, truncated flag, and selection_id
+        JSON with status, selection_id (required for edit_selection), occurrences count, 
+        and matched_text preview.
     """
     try:
+        # Validate required parameters
+        if not memory_id or not memory_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'memory_id' is required and cannot be empty.",
+                "hint": "Get valid memory IDs from memorylite_get_all_memories() or memorylite_search()"
+            }, indent=2)
+
+        # Validate mode parameter
+        valid_modes = ["exact", "regex", "lines"]
+        if mode not in valid_modes:
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid mode '{mode}'. Must be one of: {valid_modes}",
+                "hint": "Use mode='exact' for text matching, mode='regex' for regex patterns, or mode='lines' for line ranges"
+            }, indent=2)
+
+        # Validate lines mode requires start_line and end_line
+        if mode == "lines":
+            if start_line is None or end_line is None:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Lines mode requires both 'start_line' and 'end_line' parameters.",
+                    "hint": "Example: start_line=1, end_line=10"
+                }, indent=2)
+            if start_line < 1 or end_line < start_line:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"Invalid line range: start_line={start_line}, end_line={end_line}.",
+                    "hint": "start_line must be >= 1 and end_line must be >= start_line"
+                }, indent=2)
+        else:
+            # exact/regex modes require a pattern
+            if not pattern or not pattern.strip():
+                return json.dumps({
+                    "status": "error",
+                    "message": f"Parameter 'pattern' is required for mode='{mode}'.",
+                    "hint": "Provide the text or regex pattern to search for"
+                }, indent=2)
+
         mem = MemoryLite()
         mem.ensure_db_initialized()
 
@@ -2234,11 +2526,14 @@ def memorylite_select_memory(
         if "unable to open database file" in str(e):
             return json.dumps({
                 "status": "error",
-                "message": "Database not yet initiated. Save a memory first."
+                "message": "Database not yet initiated. Save a memory first using memorylite_save_memory()."
             }, indent=2)
         return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to select memory: {str(e)}"
+        }, indent=2)
 
 
 @mcp.tool
@@ -2247,23 +2542,82 @@ def memorylite_edit_selection(
     replacement: str = "",
     occurrence: int = 1
 ) -> str:
-    """Edit text based on a previous selection.
+    """Replace selected text with new text.
 
-    IMPORTANT: After editing, the selection is nullified. You must call
-    select_memory again to select new content for editing.
+    THIS IS THE SECOND STEP IN THE EDIT WORKFLOW. You MUST call select_memory FIRST
+    to get a selection_id before using this tool.
+
+    COMPLETE EDIT WORKFLOW (SELECT -> EDIT):
+      Step 1: select_memory(...) -> gets selection_id
+      Step 2: edit_selection(selection_id=selection_id, replacement="new text", occurrence=N)
+      Note: After editing, the selection_id is used up. You must call select_memory again 
+            for any additional edits.
+
+    OCCURRENCE PARAMETER (which matches to replace):
+      occurrence=0  -> Replace ALL occurrences (every match found by select_memory)
+      occurrence=1  -> Replace only the FIRST occurrence (default)
+      occurrence=2  -> Replace only the SECOND occurrence
+      occurrence=3  -> Replace only the THIRD occurrence
+      ...and so on
+
+    COMPLETE EXAMPLE - Replace all occurrences:
+      # Step 1: Find all "old_name" in the memory
+      select_memory(memory_id="260623120000", pattern="old_name", mode="exact")
+      # Returns: {"selection_id": "sel_260623120000_1", "occurrences": 3}
+      
+      # Step 2: Replace ALL 3 occurrences with "new_name"
+      edit_selection(selection_id="sel_260623120000_1", replacement="new_name", occurrence=0)
+
+    COMPLETE EXAMPLE - Replace only specific occurrences:
+      # Step 1: Find all "TODO" in the memory
+      select_memory(memory_id="260623120000", pattern="TODO", mode="exact")
+      # Returns: {"selection_id": "sel_260623120000_1", "occurrences": 5}
+      
+      # Step 2: Replace only the FIRST TODO with "DONE"
+      edit_selection(selection_id="sel_260623120000_1", replacement="DONE", occurrence=1)
+      
+      # Step 3: For more edits, call select_memory again!
+      select_memory(memory_id="260623120000", pattern="TODO", mode="exact")
+      # ... then edit_selection again with the new selection_id
+
+    IMPORTANT NOTES:
+      - The selection_id expires after editing (is "nullified")
+      - You cannot reuse a selection_id - always call select_memory first for new selections
+      - The replacement text completely replaces the matched text
 
     Args:
-        selection_id: The selection ID returned from select_memory
-        replacement: Text to replace the selected content with
-        occurrence: Which occurrence to edit:
-                    1 = first occurrence only
-                    2 = second occurrence only
-                    0 = replace ALL occurrences
+        selection_id: The selection ID returned from select_memory (required!)
+        replacement: The text to replace selected content with
+        occurrence: Which occurrence to edit: 0=ALL, 1=first, 2=second, etc.
 
     Returns:
-        JSON string with status, changes_made, edit details, and nullification notice
+        JSON with status, number of changes made, and details of what was edited.
+        Also includes a notice that the selection_id has been nullified.
     """
     try:
+        # Validate required parameters
+        if not selection_id or not selection_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'selection_id' is required and cannot be empty.",
+                "hint": "Get a selection_id from memorylite_select_memory() first. Selection IDs expire after use."
+            }, indent=2)
+
+        if not replacement or not replacement.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'replacement' is required and cannot be empty.",
+                "hint": "Provide the text to replace the selected content with"
+            }, indent=2)
+
+        # Validate occurrence parameter
+        if not isinstance(occurrence, int) or occurrence < 0:
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid occurrence value: {occurrence}. Must be a non-negative integer.",
+                "hint": "Use occurrence=0 for ALL matches, occurrence=1 for first, occurrence=2 for second, etc."
+            }, indent=2)
+
         mem = MemoryLite()
         mem.ensure_db_initialized()
 
@@ -2274,11 +2628,14 @@ def memorylite_edit_selection(
         if "unable to open database file" in str(e):
             return json.dumps({
                 "status": "error",
-                "message": "Database not yet initiated. Save a memory first."
+                "message": "Database not yet initiated. Save a memory first using memorylite_save_memory()."
             }, indent=2)
         return json.dumps({"status": "error", "message": str(e)})
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to edit selection: {str(e)}"
+        }, indent=2)
 
 
 # ============================================================================
