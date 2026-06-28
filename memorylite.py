@@ -1725,7 +1725,7 @@ def memorylite_get_memory_by_id(memory_id: str = "", details_level: int = 2) -> 
         details_level: 0=minimal (title+keywords only), 1=excludes summary, 2=full (default: 2)
 
     Returns:
-        JSON string containing the memory data
+        JSON string containing the memory data.
     """
     try:
         mem = MemoryLite()
@@ -1737,10 +1737,13 @@ def memorylite_get_memory_by_id(memory_id: str = "", details_level: int = 2) -> 
                 "message": f"No memory found with ID '{memory_id}'",
                 "data": None
             }, indent=2)
-
+        
+        message_note = "Memory retrieved successfully."
+        if any("\\" in str(value) for value in result.values() if isinstance(value, str)):
+            message_note += " Note: Backslashes in text fields appear doubled in JSON output due to JSON encoding. When parsing the JSON response, \\ becomes \\."
         return json.dumps({
             "status": "success",
-            "message": "Memory retrieved successfully",
+            "message": message_note,
             "data": result
         }, indent=2)
     except sqlite3.OperationalError as e:
@@ -1771,10 +1774,16 @@ def memorylite_get_memories_by_ids(memory_ids_str: str = "", details_level: int 
         
         results = mem.get_memories_by_ids(ids, details_level)
 
+        # Build a message note about backslashes in text fields
+        message_note = "Memories retrieved successfully."
+        if any("\\" in str(value) for memory in results for value in memory.values() if isinstance(value, str)):
+            message_note += " Note: Backslashes in text fields appear doubled in JSON output due to JSON encoding. When parsing the JSON response, \\ becomes \\."
+
         return json.dumps({
             "status": "success",
             "total_found": len(results),
-            "memories": results
+            "memories": results,
+            "message": message_note
         }, indent=2)
     except sqlite3.OperationalError as e:
         if "unable to open database file" in str(e):
