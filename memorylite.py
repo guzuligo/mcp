@@ -1,6 +1,14 @@
 """
 memorylite - Lightweight LLM Memory Database System (SQLite Backend)
 
+IMPORTANT NOTE FOR LLMs ABOUT BACKSLASH ESCAPING:
+  When retrieving text fields (title, summary) that contain backslashes, the JSON output
+  will show them as doubled (e.g., \\ instead of \). This is standard JSON encoding behavior.
+  When you parse the JSON response, each \\ in the JSON text becomes a single \ in your
+  parsed string. So if you see "summary": "test \\(tag\\)" in the JSON, after parsing
+  you get the string: test \(tag\) (with single backslashes).
+  This applies to all text fields: title, summary, matched_text, replacement, etc.
+
 Replaces JSON file storage with SQLite for better query performance,
 transactional safety, and SQL-based searching instead of regex/string_matching.
 
@@ -105,6 +113,49 @@ MEMORY_TYPE_USER_DEFINED_START = 100
 
 # Reverse mapping: lowercase name -> number
 MEMORY_TYPE_REVERSE = {v[0].lower(): k for k, v in MEMORY_TYPE_MAP.items()}
+
+
+def _normalize_backslashes(value: str) -> str:
+    """Normalize backslash sequences in a string value.
+    
+    When content has been double-escaped (e.g., by JSON transport or FastMCP),
+    backslashes get doubled. This function halves consecutive backslashes:
+      - 1 backslash  -> 1 backslash  (minimum preserved)
+      - 2 backslashes -> 1 backslash
+      - 3 backslashes -> 2 backslashes
+      - 4 backslashes -> 2 backslashes
+      - N backslashes -> (N+1)//2 backslashes
+    
+    This handles the case where content was escaped multiple times during
+    storage, ensuring retrieval produces the original content regardless
+    of how many times it was double-escaped.
+    
+    Args:
+        value: String value that may contain backslash sequences
+        
+    Returns:
+        String with backslashes normalized (halved, minimum 1 per run)
+    """
+    if not isinstance(value, str):
+        return value
+    
+    result = []
+    i = 0
+    while i < len(value):
+        if value[i] == '\\':
+            # Count consecutive backslashes
+            count = 0
+            while i < len(value) and value[i] == '\\':
+                count += 1
+                i += 1
+            # Halve the count, keeping at least 1
+            normalized_count = max(1, (count + 1) // 2)
+            result.append('\\' * normalized_count)
+        else:
+            result.append(value[i])
+            i += 1
+    
+    return ''.join(result)
 
 
 def _parse_json_or_fix(input_str: str) -> Any:
@@ -1504,6 +1555,11 @@ class MemoryLite:
             if i < len(row):
                 row_data[col] = row[i]
 
+        # Normalize backslashes in text fields to handle double-escaping from transport layers
+        for text_field in ["title", "summary"]:
+            if text_field in row_data and isinstance(row_data[text_field], str):
+                row_data[text_field] = _normalize_backslashes(row_data[text_field])
+
         # Parse JSON arrays from strings with safe error handling
         for field in ["related_ids", "keywords"]:
             row_data[field] = self._safe_parse_json(row_data.get(field), [])
@@ -1684,7 +1740,7 @@ def memorylite_get_memory_by_id(memory_id: str = "", details_level: int = 2) -> 
 
         return json.dumps({
             "status": "success",
-            "message": f"Memory retrieved successfully",
+            "message": "Memory retrieved successfully",
             "data": result
         }, indent=2)
     except sqlite3.OperationalError as e:
