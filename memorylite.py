@@ -408,6 +408,19 @@ def get_all_memory_type_info() -> list:
 class MemoryLite:
     """LLM Memory Management System using SQLite as backend."""
 
+    # Predefined separator styles to reduce LLM confusion
+    SEPARATOR_STYLES = {
+        "default": "\n\n---\n\n",
+        "newline": "\n\n",
+        "pipe": " ||| ",
+        "none": "",
+        "header": "\n\n## Update:\n\n",
+        "dash": "\n\n----------------------------------------\n\n",
+    }
+    
+    # Maximum allowed separator length (enforced to prevent confusion)
+    MAX_SEPARATOR_LENGTH = 20
+
     # Configuration - can be modified at the top level
     DB_FILE = None  # Will default to ~/.swordmemory/memory.db if not set
 
@@ -807,15 +820,18 @@ class MemoryLite:
         finally:
             db.close()
 
-    def update_memory(self, memory_id, updates: dict) -> bool:
-        """Update an existing memory.
+    def replace_memory(self, memory_id, updates: dict) -> bool:
+        """Replace fields in an existing memory.
+
+        This method REPLACES field values entirely. To ADD to fields instead of replacing,
+        use the dedicated append methods: append_to_summary(), append_to_keywords(), append_to_related_ids().
 
         Args:
             memory_id: The unique identifier of the memory to update (will be converted to string if needed)
-            updates: Dictionary of fields to update
+            updates: Dictionary of fields to replace
 
         Returns:
-            True if updated successfully, False if not found
+            True if replaced successfully, False if not found
         """
         # Ensure memory_id is always a string for consistent SQLite matching
         if not isinstance(memory_id, str):
@@ -880,6 +896,43 @@ class MemoryLite:
         Returns:
             Dict with status, original_summary_length, new_summary_length, and message
         """
+        # Validate separator length to prevent confusion
+        if len(separator) > self.MAX_SEPARATOR_LENGTH:
+            return {
+                "status": "error",
+                "error_code": "SEPARATOR_TOO_LONG",
+                "message": f"SEPARATOR VALIDATION FAILED: Your separator is {len(separator)} characters long, but the maximum allowed is {self.MAX_SEPARATOR_LENGTH} characters.",
+                "instruction": "The separator parameter is ONLY a visual divider between old and new content. It is NOT the content to append.",
+                "hint": "Use a short separator (max 20 chars) like: '\\n\\n---\\n\\n', ' ||| ', '\\n\\n## Update:\\n\\n', or '\\n\\n'",
+                "available_styles": {
+                    name: f"(length: {len(style)} chars)"
+                    for name, style in self.SEPARATOR_STYLES.items()
+                },
+                "original_separator": separator,
+                "original_separator_length": len(separator)
+            }
+
+        # Validate that separator and summary_addition are not the same content
+        # This catches the common LLM error of putting content in both fields
+        separator_stripped = separator.strip().strip('\n-|')
+        addition_stripped = summary_addition.strip()
+        
+        # If both fields contain essentially the same non-trivial content, it's likely an error
+        if (len(addition_stripped) > 20 and 
+            len(separator_stripped) > 20 and 
+            addition_stripped == separator_stripped):
+            return {
+                "status": "error",
+                "error_code": "DUPLICATE_CONTENT_DETECTED",
+                "message": "CONTENT CONFUSION DETECTED: The separator and summary_addition fields contain the same content.",
+                "instruction": "You confused the separator with the content to append. Remember:",
+                "field_guide": {
+                    "summary_addition": "THE ACTUAL CONTENT YOU WANT TO ADD (e.g., 'Additional note: meeting rescheduled')",
+                    "separator": "A SHORT VISUAL DIVIDER between old and new content (e.g., '\\n\\n---\\n\\n', ' ||| ', '\\n\\n## Update:\\n\\n')"
+                },
+                "hint": "Fix: Put your content in summary_addition, and use a short separator like '\\n\\n---\\n\\n'"
+            }
+
         db = self._get_connection()
         try:
             row = db.execute(
@@ -908,7 +961,7 @@ class MemoryLite:
                 "message": f"Summary appended to memory '{memory_id}'",
                 "original_summary_length": len(original_summary),
                 "new_summary_length": len(new_summary),
-                "separator_used": repr(separator)
+                "separator_used": separator
             }
         finally:
             db.close()
@@ -1294,6 +1347,105 @@ class MemoryLite:
             "selection_nullified": True,
             "changes_made": len(edits_applied),
             "edits": edits_applied,
+            "message": f"Selection '{selection_id}' has been nullified. Call select_memory again to select new content."
+        }
+
+    def delete_selection(self, selection_id: str, occurrence: int = 1) -> dict:
+        """Delete text based on a previous selection.
+
+        This is a convenience method that calls edit_selection with an empty replacement.
+
+        Args:
+            selection_id: The selection ID from select_memory
+            occurrence: Which occurrence to delete - 1=first, 2=second, 0=all
+
+        Returns:
+            Dict with status, changes_made, and edit details
+        """
+        return self.edit_selection(selection_id, "", occurrence)
+
+    def append_selection(self, selection_id: str, addition: str, occurrence: int = 1) -> dict:
+        """Append text after each selected match.
+
+        Unlike edit_selection (which replaces matched text), this method inserts
+        the addition text AFTER each matched occurrence, preserving the original text.
+
+        Args:
+            selection_id: The selection ID from select_memory
+            addition: Text to append after each matched occurrence
+            occurrence: Which occurrence(s) to append to - 1=first, 2=second, 0=all
+
+        Returns:
+            Dict with status, changes_made, appends (list of append details), and selection_nullified flag
+        """
+        global _selection_store
+
+        if selection_id not in _selection_store:
+            return {
+                "status": "error",
+                "message": f"Selection '{selection_id}' not found. Please call select_memory first."
+            }
+
+        sel = _selection_store[selection_id]
+        memory_id = sel["memory_id"]
+        matches = sel["matches"]
+        summary = sel["summary"]
+
+        # Determine which matches to append to based on occurrence parameter
+        if occurrence == 0:
+            # Append to all occurrences
+            indices_to_append = list(range(len(matches)))
+        elif occurrence < 0 or occurrence > len(matches):
+            return {
+                "status": "error",
+                "message": f"Occurrence {occurrence} is out of range. Found {len(matches)} match(es)."
+            }
+        else:
+            # Append to specific occurrence (1-based)
+            indices_to_append = [occurrence - 1]
+
+        if not indices_to_append:
+            return {
+                "status": "error",
+                "message": "No matches selected for appending."
+            }
+
+        # Apply appends in reverse order to preserve positions
+        new_summary = summary
+        appends_applied = []
+        for idx in sorted(indices_to_append, reverse=True):
+            m = matches[idx]
+            # Insert addition AFTER the matched text
+            new_summary = new_summary[:m["end"]] + addition + new_summary[m["end"]:]
+            appends_applied.append({
+                "occurrence": idx + 1,
+                "matched_text": summary[m["start"]:m["end"]],
+                "appended_text": addition,
+                "position": m
+            })
+
+        # Update database
+        db = self._get_connection()
+        try:
+            timestamp = self._get_timestamp()
+            db.execute(
+                "UPDATE memories SET summary = ?, updated_at = ? WHERE id = ?",
+                (new_summary, timestamp, memory_id)
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        # Nullify the selection (remove from store)
+        del _selection_store[selection_id]
+
+        return {
+            "status": "success",
+            "memory_id": memory_id,
+            "selection_id": selection_id,
+            "selection_nullified": True,
+            "changes_made": len(appends_applied),
+            "appends": appends_applied,
             "message": f"Selection '{selection_id}' has been nullified. Call select_memory again to select new content."
         }
 
@@ -2099,26 +2251,29 @@ def memorylite_delete_memory(memory_id: str = "") -> str:
 
 
 @mcp.tool
-def memorylite_update_memory(
+def memorylite_replace_memory(
     memory_id: str = "",
     updates: Union[str, dict] = "{}"
 ) -> str:
-    """Update an existing memory's fields.
+    """Replace fields in an existing memory.
 
-    USE THIS TOOL to modify any existing memory. You can update ONE field or MULTIPLE fields at once.
-    Only the fields you specify will be changed - all other fields remain unchanged.
+    USE THIS TOOL to REPLACE field values in an existing memory. This tool REPLACES values entirely -
+    it does NOT add to existing content. To ADD content without losing existing data, use:
+      - memorylite_append_to_summary() - to append to summary
+      - memorylite_append_to_keywords() - to add keywords
+      - memorylite_append_to_related_ids() - to add related IDs
 
     HOW TO USE:
       1. First, get the memory_id using memorylite_get_all_memories() or memorylite_search()
-      2. Call this tool with the memory_id and the fields you want to change
+      2. Call this tool with the memory_id and the fields you want to REPLACE
 
     UPDATES FORMAT (CHOOSE ONE):
       Option A - JSON string: '{"title": "New Title", "summary": "New content"}'
       Option B - Dict: {"title": "New Title", "summary": "New content"}
       Both work the same way. JSON string is more common when LLMs call tools.
 
-    VALID FIELDS TO UPDATE:
-      - title: New short descriptive title
+    VALID FIELDS TO REPLACE:
+      - title: New short descriptive title (replaces existing title)
       - summary: New full detailed content (see save_memory for what goes here)
       - memory_type: New type code (0-6) or type name string
       - related_ids: New list of related memory IDs (replaces existing list)
@@ -2126,30 +2281,37 @@ def memorylite_update_memory(
 
     COMPLETE EXAMPLES:
 
-      # Update just the title
-      memorylite_update_memory(
+      # Replace just the title
+      memorylite_replace_memory(
           memory_id="260623120000",
           updates='{"title": "Updated Title"}'
       )
 
-      # Update multiple fields at once
-      memorylite_update_memory(
+      # Replace multiple fields at once
+      memorylite_replace_memory(
           memory_id="260623120000",
           updates='{"title": "Better Title", "memory_type": "technical", "keywords": ["python", "new"]}'
       )
 
-      # Update summary with corrected information
-      memorylite_update_memory(
+      # Replace summary with corrected information
+      memorylite_replace_memory(
           memory_id="260623120000",
           updates='{"summary": "Corrected detailed content here..."}'
       )
 
-    TIP: Use memorylite_append_to_summary() to ADD content without losing existing content.
-         Use memorylite_update_memory() to REPLACE content entirely.
+    WHEN TO USE THIS TOOL:
+      - You need to correct/fix incorrect information in a memory
+      - You need to change a title or type
+      - You want to completely rewrite a memory's content
+
+    WHEN NOT TO USE THIS TOOL:
+      - To ADD new information without losing existing content → use append_to_summary()
+      - To ADD new keywords → use append_to_keywords()
+      - To ADD new related IDs → use append_to_related_ids()
 
     Args:
-        memory_id: The unique identifier of the memory to update (get from get_all_memories)
-        updates: JSON string or dict specifying which fields to update.
+        memory_id: The unique identifier of the memory to modify (get from get_all_memories)
+        updates: JSON string or dict specifying which fields to replace.
                  Example: '{"title": "New Title", "summary": "New content"}'
 
     Returns:
@@ -2224,7 +2386,7 @@ def memorylite_update_memory(
             else:
                 converted_updates[k] = v
 
-        success = mem.update_memory(memory_id, converted_updates or {})
+        success = mem.replace_memory(memory_id, converted_updates or {})
 
         if not success:
             return json.dumps({
@@ -2273,27 +2435,59 @@ def memorylite_append_to_summary(
     """Append text to an existing memory's summary field.
 
     USE THIS TOOL to ADD new information to a memory WITHOUT losing existing content.
-    Unlike update_memory (which REPLACES content), this tool APPENDS to what's already there.
+    Unlike memorylite_replace_memory() (which REPLACES content), this tool APPENDS to what's already there.
+
+    ⚠️  IMPORTANT - UNDERSTANDING THE TWO PARAMETERS:
+      summary_addition: THE ACTUAL CONTENT YOU WANT TO ADD
+        This is your new information, e.g., "Additional note: meeting rescheduled to Friday"
+        This field stores the NEW content that will be appended.
+      
+      separator: A SHORT VISUAL DIVIDER between old and new content (max 20 characters)
+        This is ONLY the visual separator, NOT the content to add.
+        It goes between the existing summary and your new summary_addition.
+        
+    AVAILABLE SEPARATOR STYLES (predefined, use these):
+      - "default" or "\\n\\n---\\n\\n"  (4 chars visual, recommended)
+      - "newline" or "\\n\\n"           (simple line break)
+      - "pipe" or " ||| "               (pipe separator)
+      - "header" or "\\n\\n## Update:\\n\\n"  (section header style)
+      - "none" or ""                    (no separator)
 
     USE CASES:
       - Adding follow-up information discovered later
       - Adding meeting notes as discussion progresses
       - Building up a research document incrementally
 
+    COMMON MISTAKE TO AVOID:
+      WRONG: separator="Additional note: meeting rescheduled"  ← This is content, not a separator!
+      CORRECT: summary_addition="Additional note: meeting rescheduled"
+               separator="\\n\\n---\\n\\n"
+    
     Args:
         memory_id: The unique identifier of the memory to append to
                    Get valid IDs from memorylite_get_all_memories() or memorylite_search()
-        summary_addition: Text to append to the summary (required - cannot be empty)
-        separator: Custom separator between old and new content (default: "\\n\\n---\\n\\n").
-                   You can use any string, e.g., "\\n\\n## Update:\\n\\n" or " ||| "
+        summary_addition: THE ACTUAL CONTENT TO APPEND (required - cannot be empty).
+                         Example: "Additional note: The meeting was rescheduled to Friday."
+        separator: SHORT VISUAL DIVIDER between old and new content (max 20 chars, default: "\\n\\n---\\n\\n").
+                  Use predefined styles: "\\n\\n---\\n\\n", " ||| ", "\\n\\n## Update:\\n\\n", "\\n\\n", or "".
 
     Returns:
         JSON string with status, original/new summary lengths, and separator used.
+        If validation fails (separator too long or duplicate content detected), 
+        returns an error with instructions to fix.
 
-    EXAMPLE:
+    CORRECT EXAMPLE:
         memorylite_append_to_summary(
             memory_id="260623120000",
-            summary_addition="Additional note: The meeting was rescheduled to Friday."
+            summary_addition="Additional note: The meeting was rescheduled to Friday.",
+            separator="\\n\\n---\\n\\n"
+        )
+
+    WRONG EXAMPLE (DO NOT DO THIS):
+        memorylite_append_to_summary(
+            memory_id="260623120000",
+            summary_addition="Additional note: meeting rescheduled",
+            separator="Additional note: meeting rescheduled"  ← WRONG! Same content in both fields!
         )
     """
     try:
@@ -2703,6 +2897,239 @@ def memorylite_edit_selection(
         }, indent=2)
 
 
+@mcp.tool
+def memorylite_delete_selection(
+    selection_id: str = "",
+    occurrence: int = 1
+) -> str:
+    """Delete selected text from a memory.
+
+    THIS IS THE SECOND STEP IN THE DELETE WORKFLOW. You MUST call select_memory FIRST
+    to get a selection_id before using this tool.
+
+    COMPLETE DELETE WORKFLOW (SELECT -> DELETE):
+      Step 1: select_memory(...) -> gets selection_id
+      Step 2: delete_selection(selection_id=selection_id, occurrence=N)
+      Note: After deleting, the selection_id is used up. You must call select_memory again 
+            for any additional deletions.
+
+    USE THIS TOOL to REMOVE text from a memory without replacing it with new content.
+    This is different from edit_selection where you must provide replacement text.
+
+    OCCURRENCE PARAMETER (which matches to delete):
+      occurrence=0  -> Delete ALL occurrences (every match found by select_memory)
+      occurrence=1  -> Delete only the FIRST occurrence (default)
+      occurrence=2  -> Delete only the SECOND occurrence
+      occurrence=3  -> Delete only the THIRD occurrence
+      ...and so on
+
+    COMPLETE EXAMPLE - Delete all occurrences:
+      # Step 1: Find all "obsolete_code" in the memory
+      select_memory(memory_id="260623120000", pattern="obsolete_code", mode="exact")
+      # Returns: {"selection_id": "sel_260623120000_1", "occurrences": 3}
+      
+      # Step 2: Delete ALL 3 occurrences
+      delete_selection(selection_id="sel_260623120000_1", occurrence=0)
+
+    COMPLETE EXAMPLE - Delete only specific occurrences:
+      # Step 1: Find all "TODO" in the memory
+      select_memory(memory_id="260623120000", pattern="TODO", mode="exact")
+      # Returns: {"selection_id": "sel_260623120000_1", "occurrences": 5}
+      
+      # Step 2: Delete only the FIRST TODO
+      delete_selection(selection_id="sel_260623120000_1", occurrence=1)
+      
+      # Step 3: For more deletions, call select_memory again!
+      select_memory(memory_id="260623120000", pattern="TODO", mode="exact")
+      # ... then delete_selection again with the new selection_id
+
+    WHEN TO USE THIS TOOL:
+      - You need to remove outdated/incorrect information from a memory
+      - You want to clean up a memory by removing irrelevant sections
+      - You discovered the selected text is no longer needed
+
+    WHEN NOT TO USE THIS TOOL:
+      - To change text to something else → use edit_selection()
+      - To remove an entire memory → use delete_memory()
+
+    IMPORTANT NOTES:
+      - The selection_id expires after deletion (is "nullified")
+      - You cannot reuse a selection_id - always call select_memory first for new selections
+      - Deletion is permanent - the text is removed from the summary
+
+    Args:
+        selection_id: The selection ID returned from select_memory (required!)
+        occurrence: Which occurrence to delete: 0=ALL, 1=first, 2=second, etc.
+
+    Returns:
+        JSON with status, number of changes made, and details of what was deleted.
+        Also includes a notice that the selection_id has been nullified.
+    """
+    try:
+        # Validate required parameters
+        if not selection_id or not selection_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'selection_id' is required and cannot be empty.",
+                "hint": "Get a selection_id from memorylite_select_memory() first. Selection IDs expire after use."
+            }, indent=2)
+
+        # Validate occurrence parameter
+        if not isinstance(occurrence, int) or occurrence < 0:
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid occurrence value: {occurrence}. Must be a non-negative integer.",
+                "hint": "Use occurrence=0 for ALL matches, occurrence=1 for first, occurrence=2 for second, etc."
+            }, indent=2)
+
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
+
+        result = mem.delete_selection(selection_id, occurrence)
+
+        return json.dumps(result, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first using memorylite_save_memory()."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to delete selection: {str(e)}"
+        }, indent=2)
+
+
+@mcp.tool
+def memorylite_append_selection(
+    selection_id: str = "",
+    addition: str = "",
+    occurrence: int = 1
+) -> str:
+    """Append text after previously selected matches.
+
+    THIS IS THE SECOND STEP IN THE APPEND WORKFLOW. You MUST call select_memory FIRST
+    to get a selection_id before using this tool.
+
+    COMPLETE APPEND WORKFLOW (SELECT -> APPEND):
+      Step 1: select_memory(...) -> gets selection_id
+      Step 2: append_selection(selection_id=selection_id, addition="text to add", occurrence=N)
+      Note: After appending, the selection_id is used up. You must call select_memory again 
+            for any additional appends.
+
+    USE THIS TOOL to INSERT text AFTER selected matches WITHOUT replacing the original text.
+    This is different from:
+      - edit_selection() which REPLACES matched text with new content
+      - delete_selection() which REMOVES matched text entirely
+
+    USE CASES:
+      - Continuing incomplete code (e.g., append closing braces, function bodies)
+      - Adding fix comments after bug markers
+      - Extending partial sentences or thoughts
+      - Adding follow-up explanations after selected content
+
+    OCCURRENCE PARAMETER (which matches to append to):
+      occurrence=0  -> Append to ALL occurrences (every match found by select_memory)
+      occurrence=1  -> Append only after the FIRST occurrence (default)
+      occurrence=2  -> Append only after the SECOND occurrence
+      occurrence=3  -> Append only after the THIRD occurrence
+      ...and so on
+
+    COMPLETE EXAMPLE - Continue incomplete code:
+      # Step 1: Find incomplete function definition
+      select_memory(memory_id="260623120000", pattern="def my_function(", mode="exact")
+      # Returns: {"selection_id": "sel_260623120000_1", "occurrences": 1}
+      
+      # Step 2: Append the rest of the function
+      append_selection(
+          selection_id="sel_260623120000_1", 
+          addition="):\n    # implementation here\n    pass", 
+          occurrence=1
+      )
+
+    COMPLETE EXAMPLE - Add fix comment after bug marker:
+      # Step 1: Find all BUG markers
+      select_memory(memory_id="260623120000", pattern="BUG:", mode="exact")
+      # Returns: {"selection_id": "sel_260623120000_1", "occurrences": 3}
+      
+      # Step 2: Add fix comment after ALL BUG markers
+      append_selection(
+          selection_id="sel_260623120000_1", 
+          addition=" FIXED - added input validation", 
+          occurrence=0
+      )
+
+    WHEN TO USE THIS TOOL:
+      - Memory contains incomplete/partial content that needs continuation
+      - You want to add annotations or comments after selected text
+      - You need to extend partial code blocks or sentences
+      - You discovered fixes or additions that should follow existing content
+
+    WHEN NOT TO USE THIS TOOL:
+      - To change text to something else → use edit_selection()
+      - To remove text → use delete_selection()
+      - To add content at the end of a memory → use append_to_summary()
+
+    IMPORTANT NOTES:
+      - The selection_id expires after appending (is "nullified")
+      - You cannot reuse a selection_id - always call select_memory first for new selections
+      - The original matched text is preserved; addition is inserted AFTER it
+
+    Args:
+        selection_id: The selection ID returned from select_memory (required!)
+        addition: The text to append after each matched occurrence (required!)
+        occurrence: Which occurrence(s) to append to: 0=ALL, 1=first, 2=second, etc.
+
+    Returns:
+        JSON with status, number of changes made, and details of what was appended.
+        Also includes a notice that the selection_id has been nullified.
+    """
+    try:
+        # Validate required parameters
+        if not selection_id or not selection_id.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'selection_id' is required and cannot be empty.",
+                "hint": "Get a selection_id from memorylite_select_memory() first. Selection IDs expire after use."
+            }, indent=2)
+
+        if not addition or not addition.strip():
+            return json.dumps({
+                "status": "error",
+                "message": "Parameter 'addition' is required and cannot be empty.",
+                "hint": "Provide the text to append after the selected content"
+            }, indent=2)
+
+        # Validate occurrence parameter
+        if not isinstance(occurrence, int) or occurrence < 0:
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid occurrence value: {occurrence}. Must be a non-negative integer.",
+                "hint": "Use occurrence=0 for ALL matches, occurrence=1 for first, occurrence=2 for second, etc."
+            }, indent=2)
+
+        mem = MemoryLite()
+        mem.ensure_db_initialized()
+
+        result = mem.append_selection(selection_id, addition, occurrence)
+
+        return json.dumps(result, indent=2)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            return json.dumps({
+                "status": "error",
+                "message": "Database not yet initiated. Save a memory first using memorylite_save_memory()."
+            }, indent=2)
+        return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to append selection: {str(e)}"
+        }, indent=2)
+
+
 # ============================================================================
 # CLI Argument Parsing and Main Entry Point
 # ============================================================================
@@ -2762,12 +3189,14 @@ if __name__ == "__main__":
     print("  - memorylite_get_all_words: Extract all words from database with field-level breakdown (EXPENSIVE)")
     print("  - memorylite_get_memory_stats: View memory statistics")
     print("  - memorylite_delete_memory: Delete a memory item")
-    print("  - memorylite_update_memory: Update an existing memory (replaces fields)")
+    print("  - memorylite_replace_memory: Replace fields in an existing memory")
     print("  - memorylite_append_to_summary: Append text to a memory's summary (with configurable separator)")
     print("  - memorylite_append_to_keywords: Add keywords without losing existing ones")
     print("  - memorylite_append_to_related_ids: Add related IDs without losing existing links")
     print("  - memorylite_select_memory: Select/search text within a memory's summary (exact, regex, or lines mode)")
     print("  - memorylite_edit_selection: Edit previously selected text (use selection_id from select_memory)")
+    print("  - memorylite_delete_selection: Delete previously selected text (use selection_id from select_memory)")
+    print("  - memorylite_append_selection: Append text after previously selected text (use selection_id from select_memory)")
     print()
     print("Memory Type Codes:")
     print("  RESERVED TYPES (0-6):")

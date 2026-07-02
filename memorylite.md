@@ -196,10 +196,13 @@ SELECT id, title, summary, memory_type, related_ids, keywords, created_at, updat
 |-----------|------|-------------|
 | details_level | int | 0=minimal (title+keywords only), 1=excludes summary (default), 2=full |
 
-#### `update_memory(memory_id, updates)`
-Updates an existing memory record. Returns True if updated successfully.
+#### `replace_memory(memory_id, updates)`
+Replaces fields in an existing memory record. Returns True if replacement was successful.
 
-**Note:** This method REPLACES field values entirely. To append to fields instead of replacing, use the dedicated append methods below.
+**Note:** This method REPLACES field values entirely - it does NOT add to existing content. To ADD content without losing existing data, use the dedicated append methods:
+- `append_to_summary()` - to append text to summary
+- `append_to_keywords()` - to add keywords
+- `append_to_related_ids()` - to add related IDs
 
 ```sql
 UPDATE memories SET title = ?, summary = ?, ... , updated_at = ? WHERE id = ?
@@ -278,6 +281,34 @@ Returns: Dict with `status`, `changes_made`, `edits`, and `selection_nullified` 
 
 **Important:** After editing, the selection is nullified. You must call `select_memory` again to select new content.
 
+#### `delete_selection(selection_id, occurrence)`
+Deletes text based on a previous selection. This is a convenience method that removes selected text without replacement.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| selection_id | str | The selection ID returned from `select_memory` |
+| occurrence | int | Which occurrence to delete: `1`=first, `2`=second, `0`=all |
+
+Returns: Dict with `status`, `changes_made`, `edits`, and `selection_nullified` flag.
+
+**Use this tool** when you want to remove text without replacing it with new content.
+
+#### `append_selection(selection_id, addition, occurrence)`
+Appends text after each selected match. Unlike `edit_selection` (which replaces), this preserves the original text and inserts new content after it.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| selection_id | str | The selection ID returned from `select_memory` |
+| addition | str | Text to append after each matched occurrence |
+| occurrence | int | Which occurrence(s) to append to: `1`=first, `2`=second, `0`=all |
+
+Returns: Dict with `status`, `changes_made`, `appends`, and `selection_nullified` flag.
+
+**Use this tool** for:
+- Continuing incomplete code (e.g., append closing braces, function bodies)
+- Adding fix comments after bug markers
+- Extending partial sentences or thoughts
+
 #### `delete_memory(memory_id)`
 Deletes a specific memory by ID. Returns True if deleted successfully.
 
@@ -327,12 +358,14 @@ All tools return JSON strings for MCP compatibility. Each tool function catches 
 | `get_all_keywords` | List all keywords and titles | Optional pattern filter |
 | `get_memory_stats` | View memory statistics | None |
 | `delete_memory` | Delete a memory item | memory_id |
-| `update_memory` | Update an existing memory (replaces fields) | memory_id, updates (JSON string or dict) |
+| `replace_memory` | Replace fields in an existing memory | memory_id, updates (JSON string or dict) |
 | `append_to_summary` | Append text to summary with configurable separator | memory_id, summary_addition, separator (default: `"\\n\\n---\\n\\n"`) |
 | `append_to_keywords` | Add keywords without losing existing ones | memory_id, keywords (JSON string or list) |
 | `append_to_related_ids` | Add related IDs without losing existing links | memory_id, related_ids (JSON string or list) |
 | `select_memory` | Select/search text within a memory's summary | memory_id, pattern, mode (exact/regex/lines), start_line, end_line |
 | `edit_selection` | Edit previously selected text | selection_id, replacement, occurrence (1=first, 2=second, 0=all) |
+| `delete_selection` | Delete previously selected text | selection_id, occurrence (1=first, 2=second, 0=all) |
+| `append_selection` | Append text after previously selected text | selection_id, addition, occurrence (1=first, 2=second, 0=all) |
 
 ## Best Practices for LLM Usage
 
@@ -417,8 +450,8 @@ edit_selection(selection_id="sel_260620174500_1", replacement="error", occurrenc
 The append methods are designed for **accumulating information** over time without losing existing data:
 
 ```python
-# Instead of update_memory (which replaces):
-# update_memory(memory_id, {"keywords": ["new_keyword"]})  # Loses old keywords!
+# Instead of replace_memory (which replaces):
+# replace_memory(memory_id, {"keywords": ["new_keyword"]})  # Loses old keywords!
 
 # Use append_to_keywords (which adds):
 append_to_keywords(memory_id, ["new_keyword"])  # Keeps old keywords + adds new
