@@ -1094,6 +1094,7 @@ def create_file(
     }
 
 
+import anyio
 import threading
 import uuid
 
@@ -1718,6 +1719,56 @@ def edit_after_select_file_content(
 _process_history = []
 _MAX_HISTORY = 10
 
+# =============================================================================
+# Output Cache for Completed Processes
+# =============================================================================
+# Stores output of completed processes so they can be retrieved even after
+# the process registry entry has been cleaned up. This addresses the issue
+# where get_command_output returns nothing if called after a delay following
+# command completion.
+
+_output_cache = {}
+_OUTPUT_CACHE_MAX_SIZE = 5  # Keep only the 5 most recent completed processes
+_OUTPUT_CACHE_MAX_CHARS = 5000  # Per-stream character threshold for truncation
+_OUTPUT_CACHE_MAX_LINES = 50  # Lines to keep when output is truncated
+
+
+def _prune_output_cache():
+    """Remove oldest entries from output cache if it exceeds MAX_SIZE."""
+    global _output_cache
+    if len(_output_cache) > _OUTPUT_CACHE_MAX_SIZE:
+        # Sort by end_time and keep only the newest entries
+        sorted_entries = sorted(
+            _output_cache.items(),
+            key=lambda x: x[1].get("end_time", 0),
+            reverse=True,
+        )
+        # Keep only the newest _OUTPUT_CACHE_MAX_SIZE entries
+        _output_cache = dict(sorted_entries[:_OUTPUT_CACHE_MAX_SIZE])
+
+
+def _tail_output(output, max_chars, max_lines):
+    """Truncate output if it exceeds max_chars, keeping only the last max_lines.
+
+    Returns (truncated_output, original_lines, was_truncated).
+    """
+    original_lines = len(output.splitlines()) if output else 0
+    original_chars = len(output)
+
+    if original_chars <= max_chars:
+        return output, original_lines, False
+
+    # Truncate to last max_lines
+    lines = output.splitlines()
+    if len(lines) > max_lines:
+        truncated_output = '\n'.join(lines[-max_lines:])
+        return truncated_output, original_lines, True
+
+    # Character threshold exceeded but line count is fine — still truncate
+    # by keeping last max_lines
+    truncated_output = '\n'.join(lines[-max_lines:])
+    return truncated_output, original_lines, True
+
 
 def _add_to_history(entry):
     """Add a process entry to the history, keeping only the most recent _MAX_HISTORY entries."""
@@ -1948,7 +1999,7 @@ def _apply_tail(text, n):
 
 
 @mcp.tool()
-def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4, visible: bool = False, show_output: bool = False) -> dict:
+async def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wait_time: int = 4, visible: bool = False, show_output: bool = False, instant_wait_time: float = 5.0) -> dict:
     """Execute a command and optionally show it in a visible terminal window.
 
     ⚠️ IMPORTANT - Common Pitfalls:
@@ -1981,6 +2032,8 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
         wait_time: Recommended wait time in seconds between polling calls. Default: 4
         visible: If True, run the command in a visible terminal window. Default: False (hidden)
         show_output: If True, include a preview of the first 50 lines of captured output. Default: False
+        instant_wait_time: Maximum seconds to wait when checking if a fast command completes instantly.
+                           Use 0 to disable instant feedback. Default: 5.0
 
     Returns:
         A dictionary with process_id, return code, execution time, and optionally output preview.
@@ -2053,9 +2106,9 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
 
         # For hidden mode: wait briefly to check if the command completes instantly
         # This provides immediate feedback for fast commands like 'echo', 'ls', etc.
-        if not use_visible:
-            # Wait a very short time for the reader threads to capture output
-            time.sleep(0.1)
+        # Using anyio.sleep instead of time.sleep to avoid blocking the asyncio event loop.
+        if not use_visible and instant_wait_time > 0:
+            await anyio.sleep(instant_wait_time)
             proc_status = process.poll()
 
             # If command completed instantly, capture final output immediately
@@ -2078,13 +2131,30 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
                     "stderr": initial_stderr,
                 })
 
+                # Also cache in _output_cache for persistent retrieval via get_command_output
+                # Truncate large outputs to preserve memory while maintaining accessibility
+                stdout_cached, stdout_orig_lines, _ = _tail_output(initial_stdout, _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+                stderr_cached, stderr_orig_lines, _ = _tail_output(initial_stderr, _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+
+                _output_cache[process_id] = {
+                    "command": command,
+                    "return_code": proc_status,
+                    "start_time": start_time,
+                    "end_time": time.time(),
+                    "stdout": stdout_cached,
+                    "stderr": stderr_cached,
+                    "original_stdout_lines": stdout_orig_lines,
+                    "original_stderr_lines": stderr_orig_lines,
+                }
+                _prune_output_cache()
+
                 # Remove from registry since it's complete
                 del _process_registry[process_id]
 
                 end_time = time.time()
                 execution_time = end_time - start_time
-                stdout_preview, stdout_total, stdout_returned = _apply_tail(initial_stdout, 50)
-                stderr_preview, stderr_total, stderr_returned = _apply_tail(initial_stderr, 50)
+                stdout_preview, stdout_total, stdout_returned = _apply_tail(stdout_cached, 50)
+                stderr_preview, stderr_total, stderr_returned = _apply_tail(stderr_cached, 50)
                 return {
                     "command": command,
                     "working_dir": os.path.abspath(working_dir),
@@ -2147,12 +2217,40 @@ def execute_command(command: str, working_dir: str = ".", timeout: int = 300, wa
     except subprocess.TimeoutExpired:
         end_time = time.time()
         execution_time = end_time - start_time
-        try:
-            process.kill()
-        except (ProcessLookupError, AttributeError):
-            pass
+        # Process may not have been successfully created if TimeoutExpired raised before Popen returned
+        if 'process' in locals() and process is not None:
+            try:
+                process.kill()
+            except (ProcessLookupError, AttributeError):
+                pass
         # Try to read any output captured so far
         captured_stdout, captured_stderr = _read_output_from_file(output_file)
+        # Also try to get output from memory (thread-captured chunks)
+        if captured_stdout == '' or captured_stderr == '':
+            if process_id in _process_registry:
+                mem_stdout = ''.join(_process_registry[process_id].get("stdout_chunks", []))
+                mem_stderr = ''.join(_process_registry[process_id].get("stderr_chunks", []))
+                if not captured_stdout:
+                    captured_stdout = mem_stdout
+                if not captured_stderr:
+                    captured_stderr = mem_stderr
+        # Cache the output so get_command_output can retrieve it later
+        stdout_cached, stdout_orig_lines, _ = _tail_output(captured_stdout, _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+        stderr_cached, stderr_orig_lines, _ = _tail_output(captured_stderr, _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+        _output_cache[process_id] = {
+            "command": command,
+            "return_code": -1,
+            "start_time": start_time,
+            "end_time": end_time,
+            "stdout": stdout_cached,
+            "stderr": stderr_cached,
+            "original_stdout_lines": stdout_orig_lines,
+            "original_stderr_lines": stderr_orig_lines,
+        }
+        _prune_output_cache()
+        # Clean up registry
+        if process_id in _process_registry:
+            del _process_registry[process_id]
         timeout_msg = captured_stderr + "\n[TIMEOUT] Command timed out after {} seconds".format(effective_timeout)
         stdout_preview, stdout_total, stdout_returned = _apply_tail(captured_stdout, 50) if show_output else (captured_stdout, len(captured_stdout.splitlines()) if captured_stdout else 0, len(captured_stdout.splitlines()) if captured_stdout else 0)
         stderr_preview, stderr_total, stderr_returned = _apply_tail(timeout_msg, 50) if show_output else (timeout_msg, len(timeout_msg.splitlines()) if timeout_msg else 0, len(timeout_msg.splitlines()) if timeout_msg else 0)
@@ -2216,7 +2314,7 @@ def _get_latest_process_id() -> str | None:
 
 
 @mcp.tool()
-def get_command_output(
+async def get_command_output(
     process_id: str = None,
     wait_time: int = 4,
     tail: int = None,
@@ -2297,8 +2395,23 @@ def get_command_output(
                 poll_result = process.poll()
 
                 if poll_result is not None:
-                    # Process completed - get final output
+                    # Process completed - get final output and cache it for later retrieval
                     stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
+                    # Cache the output so get_command_output can retrieve it later
+                    stdout_cached, stdout_orig_lines, _ = _tail_output(stdout_from_mem if stdout_from_mem else '', _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+                    stderr_cached, stderr_orig_lines, _ = _tail_output(stderr_from_mem if stderr_from_mem else '', _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+                    _output_cache[process_id] = {
+                        "command": entry["command"],
+                        "return_code": poll_result,
+                        "start_time": entry.get("start_time"),
+                        "end_time": time.time(),
+                        "stdout": stdout_cached,
+                        "stderr": stderr_cached,
+                        "original_stdout_lines": stdout_orig_lines,
+                        "original_stderr_lines": stderr_orig_lines,
+                    }
+                    _prune_output_cache()
+
                     stdout_result, stdout_total, stdout_returned = _apply_tail(stdout_from_mem if stdout_from_mem else '', tail)
                     stderr_result, stderr_total, stderr_returned = _apply_tail(stderr_from_mem if stderr_from_mem else '', tail)
                     waited = round(time.time() - start_wait, 2)
@@ -2321,8 +2434,8 @@ def get_command_output(
                         },
                     }
 
-                # Process still running - sleep and check again
-                time.sleep(poll_interval)
+                # Process still running — sleep without blocking the asyncio event loop
+                await anyio.sleep(poll_interval)
                 continue
             elif process_id in [e.get("process_id") for e in _process_history]:
                 # Process completed and moved to history
@@ -2377,8 +2490,22 @@ def get_command_output(
             poll_result = process.poll()
 
             if poll_result is not None:
-                # Process completed just as we checked timeout
+                # Process completed just as we checked timeout - cache for later retrieval
                 stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
+                # Cache the output so get_command_output can retrieve it later
+                stdout_cached, stdout_orig_lines, _ = _tail_output(stdout_from_mem if stdout_from_mem else '', _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+                stderr_cached, stderr_orig_lines, _ = _tail_output(stderr_from_mem if stderr_from_mem else '', _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+                _output_cache[process_id] = {
+                    "command": entry["command"],
+                    "return_code": poll_result,
+                    "start_time": entry.get("start_time"),
+                    "end_time": time.time(),
+                    "stdout": stdout_cached,
+                    "stderr": stderr_cached,
+                    "original_stdout_lines": stdout_orig_lines,
+                    "original_stderr_lines": stderr_orig_lines,
+                }
+                _prune_output_cache()
                 stdout_result, stdout_total, stdout_returned = _apply_tail(stdout_from_mem if stdout_from_mem else '', tail)
                 stderr_result, stderr_total, stderr_returned = _apply_tail(stderr_from_mem if stderr_from_mem else '', tail)
                 waited = round(time.time() - start_wait, 2)
@@ -2428,6 +2555,47 @@ def get_command_output(
 
     # Normal polling mode (no wait_for_completion)
     if process_id not in _process_registry:
+        # First check output cache for recently completed processes
+        if process_id in _output_cache:
+            cache_entry = _output_cache[process_id]
+            cached_stdout = cache_entry.get("stdout", "")
+            cached_stderr = cache_entry.get("stderr", "")
+            orig_stdout_lines = cache_entry.get("original_stdout_lines", len(cached_stdout.splitlines()) if cached_stdout else 0)
+            orig_stderr_lines = cache_entry.get("original_stderr_lines", len(cached_stderr.splitlines()) if cached_stderr else 0)
+
+            stdout_result, stdout_total, stdout_returned = _apply_tail(cached_stdout, tail)
+            stderr_result, stderr_total, stderr_returned = _apply_tail(cached_stderr, tail)
+            lines_discarded_stdout = orig_stdout_lines - stdout_total
+            lines_discarded_stderr = orig_stderr_lines - stderr_total
+
+            return {
+                "process_id": process_id,
+                "inferred_process_id": inferred_process_id,
+                "stdout": stdout_result,
+                "stderr": stderr_result,
+                "success": cache_entry.get("return_code") == 0,
+                "is_complete": True,
+                "status": "completed" if cache_entry.get("return_code") == 0 else "failed",
+                "return_code": cache_entry.get("return_code"),
+                "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "recommended_wait_time": wait_time,
+                "output_source": "cache",
+                "output_summary": {
+                    "stdout": {
+                        "original_lines": orig_stdout_lines,
+                        "returned_lines": stdout_returned,
+                        "lines_omitted": stdout_total - stdout_returned,
+                        "lines_discarded": lines_discarded_stdout,
+                    },
+                    "stderr": {
+                        "original_lines": orig_stderr_lines,
+                        "returned_lines": stderr_returned,
+                        "lines_omitted": stderr_total - stderr_returned,
+                        "lines_discarded": lines_discarded_stderr,
+                    },
+                },
+            }
+
         # Check history for completed processes
         for entry in _process_history:
             if entry["process_id"] == process_id:
@@ -2451,6 +2619,7 @@ def get_command_output(
                         "stderr": {"total_lines": stderr_total, "returned_lines": stderr_returned, "lines_omitted": stderr_total - stderr_returned},
                     },
                 }
+
         return {
             "process_id": process_id,
             "inferred_process_id": inferred_process_id,
@@ -2473,6 +2642,24 @@ def get_command_output(
 
     # Get all output from registry (memory + file)
     stdout_from_mem, stderr_from_mem = _get_all_output_from_registry(process_id)
+
+    # If process just completed during this poll, cache the output for later retrieval
+    if is_complete and poll_result is not None:
+        stdout_cached, stdout_orig_lines, _ = _tail_output(stdout_from_mem if stdout_from_mem else '', _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+        stderr_cached, stderr_orig_lines, _ = _tail_output(stderr_from_mem if stderr_from_mem else '', _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+        _output_cache[process_id] = {
+            "command": entry["command"],
+            "return_code": poll_result,
+            "start_time": entry.get("start_time"),
+            "end_time": time.time(),
+            "stdout": stdout_cached,
+            "stderr": stderr_cached,
+            "original_stdout_lines": stdout_orig_lines,
+            "original_stderr_lines": stderr_orig_lines,
+        }
+        _prune_output_cache()
+        # Clean up registry since process is complete
+        del _process_registry[process_id]
 
     stdout_result, stdout_total, stdout_returned = _apply_tail(stdout_from_mem if stdout_from_mem else '', tail)
     stderr_result, stderr_total, stderr_returned = _apply_tail(stderr_from_mem if stderr_from_mem else '', tail)
@@ -2639,6 +2826,24 @@ def kill_process(process_id: str) -> dict:
             final_stdout = ''.join(entry.get("stdout_chunks", []))
             final_stderr = ''.join(entry.get("stderr_chunks", []))
 
+        # Cache the output so get_command_output can retrieve it later even after cleanup
+        # This addresses the issue where get_command_output returns "not_found" if called
+        # after the process has been killed and the registry entry was removed.
+        stdout_cached, stdout_orig_lines, _ = _tail_output(final_stdout, _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+        stderr_cached, stderr_orig_lines, _ = _tail_output(final_stderr, _OUTPUT_CACHE_MAX_CHARS, _OUTPUT_CACHE_MAX_LINES)
+
+        _output_cache[process_id] = {
+            "command": entry["command"],
+            "return_code": process.returncode if hasattr(process, 'returncode') else None,
+            "start_time": entry.get("start_time"),
+            "end_time": time.time(),
+            "stdout": stdout_cached,
+            "stderr": stderr_cached,
+            "original_stdout_lines": stdout_orig_lines,
+            "original_stderr_lines": stderr_orig_lines,
+        }
+        _prune_output_cache()
+
         _add_to_history({
             "process_id": process_id,
             "command": entry["command"],
@@ -2667,12 +2872,12 @@ def kill_process(process_id: str) -> dict:
 
 
 @mcp.tool()
-def wait_for_process(process_id: str = None, wait_time: int = 10) -> dict:
+async def wait_for_process(process_id: str = None, wait_time: int = 10) -> dict:
     """Wait for a specified duration, optionally waiting for a process to complete.
 
-    This tool blocks execution for the specified number of seconds, allowing the LLM
-    to give time for long-running commands to produce output without spamming
-    get_command_output or check_progress calls.
+    This tool yields control back to the asyncio event loop (using anyio.sleep),
+    allowing the LLM to give time for long-running commands to produce output without
+    spamming get_command_output or check_progress calls — without blocking the event loop.
 
     When a process_id is provided, the tool will return early if the process completes
     before the wait_time expires (checked every second).
@@ -2719,8 +2924,8 @@ def wait_for_process(process_id: str = None, wait_time: int = 10) -> dict:
                     "status_msg": "completed" if poll_result == 0 else "failed",
                 }
 
-            # Process still running — sleep a bit and check again
-            time.sleep(1)
+            # Process still running — yield to event loop and check again
+            await anyio.sleep(1)
             elapsed = time.time() - start_time
 
         # Waited full duration but process still running
@@ -2735,8 +2940,8 @@ def wait_for_process(process_id: str = None, wait_time: int = 10) -> dict:
         }
 
     else:
-        # No process_id — just sleep for the specified duration
-        time.sleep(wait_time)
+        # No process_id — yield to event loop for the specified duration
+        await anyio.sleep(wait_time)
         actual_waited = round(time.time() - start_time, 2)
         return {
             "status": "success",
