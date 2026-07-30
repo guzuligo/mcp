@@ -392,14 +392,15 @@ class Notebook:
         if not git_dir.exists():
             return {"status": "skipped", "message": "Git not initialized"}
         try:
-            # Check for staged changes before committing
+            # Stage all changes first, then check if anything was actually staged
+            subprocess.run(["git", "add", "."], cwd=str(root), capture_output=True, check=True)
+            # --quiet returns 0 if identical (nothing new to commit), 1 if changes exist
             check = subprocess.run(
                 ["git", "diff", "--cached", "--quiet"],
                 cwd=str(root), capture_output=True
             )
             if check.returncode == 0:
                 return {"status": "skipped", "message": "No changes to commit"}
-            subprocess.run(["git", "add", "."], cwd=str(root), capture_output=True, check=True)
             result = subprocess.run(
                 ["git", "commit", "-m", message],
                 cwd=str(root), capture_output=True, text=True, check=True
@@ -1116,13 +1117,13 @@ class Notebook:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return {"status": "error", "message": "Failed to read git log"}
     
-    def git_diff(self, note_id: str, from_rev: str = "", to_rev: str = "") -> dict:
+    def git_diff(self, note_id: str, from_rev: str = "HEAD", to_rev: str = "") -> dict:
         """Show diff between two revisions of a note.
         
         Args:
             note_id: The ID of the note
-            from_rev: Starting revision (default: HEAD~1)
-            to_rev: Ending revision (default: HEAD)
+            from_rev: Starting revision (default: HEAD — working tree vs last commit)
+            to_rev: Ending revision (optional; omit or pass "" for working tree diff)
             
         Returns:
             Dict with status and diff text.
@@ -1145,11 +1146,24 @@ class Notebook:
         if not git_dir.exists():
             return {"status": "success", "note_id": note_id, "diff": "", "message": "Git not initialized."}
         
-        from_r = from_rev if from_rev else "HEAD~1"
-        to_r = to_rev if to_rev else "HEAD"
+        from_r = from_rev if from_rev else "HEAD"
         
         try:
             rel_path = filepath.relative_to(root)
+            # If to_rev is empty, compare working tree against from_rev (shows uncommitted changes)
+            if not to_rev:
+                result = subprocess.run(
+                    ["git", "diff", from_r, "--", str(rel_path)],
+                    cwd=str(root), capture_output=True, text=True
+                )
+                return {
+                    "status": "success",
+                    "note_id": note_id,
+                    "from_rev": from_r,
+                    "to_rev": "(working tree)",
+                    "diff": result.stdout.strip() or "(no changes)"
+                }
+            to_r = to_rev
             result = subprocess.run(
                 ["git", "diff", from_r, to_r, "--", str(rel_path)],
                 cwd=str(root), capture_output=True, text=True
