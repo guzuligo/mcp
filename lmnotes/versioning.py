@@ -19,13 +19,18 @@ class GitService:
     def __init__(self, notebook: "Notebook"):
         self.nb = notebook
 
-    def git_init(self) -> None:
-        """Initialize git repo in notebook folder. Safe to call repeatedly."""
+    def git_init(self) -> bool:
+        """Initialize git repo in notebook folder. Safe to call repeatedly.
+        
+        Returns:
+            True if git was initialized, False if it already existed or failed.
+        """
         root = Path(self.nb.folder)
         git_dir = root / ".git"
         if git_dir.exists():
             self._ensure_git_user_config(str(root))
-            return
+            return False  # Already initialized
+        
         try:
             subprocess.run(
                 ["git", "init", "--initial-branch=main"],
@@ -42,8 +47,9 @@ class GitService:
                     ["git", "commit", "-m", "Initial notebook structure"],
                     cwd=str(root), capture_output=True, check=True
                 )
+            return True  # Successfully initialized
         except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
+            return False  # Failed to initialize
 
     @staticmethod
     def _ensure_git_user_config(repo_path: str) -> None:

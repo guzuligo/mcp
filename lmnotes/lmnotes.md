@@ -730,7 +730,7 @@ python lmnotes.py --folder ~/my_notes/
 
 ### Editing Documentation
 - **Tool docs**: Edit `lmnotes/manual.md` — compact format, one section per tool
-- **General docs**: Edit `lmnotes.md` — this file
+- **General docs**: Edit `lmnotes/lmnotes.md` — this file
 - **Quick-start guide**: In `lmnotes/manual.md`, before the first `## Tool:` section
 
 ### Key Architecture Notes

@@ -23,12 +23,10 @@ class EditService:
     def require_initialized(self) -> Optional[dict]:
         """Return an error dict if the notebook has not been initialized, else None."""
         # pylint: disable=import-outside-toplevel
-        import lmnotes as _lmn
+        from lmnotes.notebook import _current_session, _sessions
         
-        if not _lmn._initialized:
-            return {"status": "error", "message": "Notebook not initialized. Call lmnotes_init_notebook first."}
-        
-        if not getattr(_lmn, '_initialized', False):
+        # Check if a session is active
+        if _current_session == "000" or _current_session not in _sessions:
             return {"status": "error", "message": "Notebook not initialized. Call lmnotes_init_notebook first."}
         
         return None

@@ -23,14 +23,10 @@ class OperationsService:
     def require_initialized(self) -> Optional[dict]:
         """Return an error dict if the notebook has not been initialized, else None."""
         # pylint: disable=import-outside-toplevel
-        import lmnotes as _lmn
+        from lmnotes.notebook import _current_session, _sessions
         
-        # Check our own module state (primary source of truth after init_notebook syncs both)
-        if not _lmn._initialized:
-            return {"status": "error", "message": "Notebook not initialized. Call lmnotes_init_notebook first."}
-        
-        # Also verify parent lmnotes module agrees — catches test-side resets
-        if not getattr(_lmn, '_initialized', False):
+        # Check if a session is active
+        if _current_session == "000" or _current_session not in _sessions:
             return {"status": "error", "message": "Notebook not initialized. Call lmnotes_init_notebook first."}
         
         return None
@@ -108,66 +104,8 @@ class OperationsService:
                     count += 1
         return count
 
-    def init_notebook(self, folder: str = None) -> dict:
-        """Initialize or reconfigure the notebook folder location.
-        
-        Sets a global reference so all subsequent tool calls use this folder.
-        Only creates the root directory if it doesn't exist. Subfolders are 
-        created lazily on first write.
-        
-        Args:
-            folder: Path to use as notebook root. If ends with '/', appends .lmnotes/.
-            
-        Returns:
-            Dict with status and resolved path.
-        """
-        # pylint: disable=import-outside-toplevel
-        import lmnotes as _lmn
-        from lmnotes.utils import resolve_folder, ensure_ready, VALID_FOLDERS  # noqa: F401
-        
-        if folder:
-            from lmnotes.notebook import Notebook  # noqa: F811
-            nb_temp = Notebook(folder)
-            folder = str(nb_temp.folder)
-        
-        # Access globals via notebook module (single source of truth)
-        # Use module-level access to get current value at runtime, not captured at import time
-        from lmnotes import notebook as _nb_mod  # noqa: F401
-        # If no folder specified, use default ~/.lmnotes/
-        if folder:
-            root = Path(folder)
-        elif _nb_mod._notebook_folder:
-            root = Path(_nb_mod._notebook_folder)
-        else:
-            root = Path.home() / ".lmnotes"
-        
-        if not root.exists():
-            root.mkdir(parents=True, exist_ok=True)
-        
-        nb = _nb_mod.Notebook(str(root))
-        nb._write_root_index()
-        nb._git_init()  # type: ignore[call-arg]
-        
-        # Set global state via the notebook module (single source of truth)
-        # All other modules import these by reference, so this is visible everywhere.
-        try:
-            from . import notebook as _nb_mod  # pylint: disable=import-outside-toplevel
-            _nb_mod._initialized = True
-            _nb_mod._notebook_folder = str(root)
-        except (ImportError, AttributeError):
-            pass
-        
-        # Also sync parent lmnotes module (for test compatibility)
-        try:
-            _lmn._initialized = True
-            _lmn._notebook_folder = str(root)
-        except (ImportError, AttributeError):
-            pass
-        
-        result = {"status": "success", "message": "Notebook ready."}
-        if _lmn.DEBUG:
-            result["notebook_folder"] = str(root)
-        return result
+    # Note: init_notebook is now handled by init_session() in notebook.py
+    # This old method is kept for backwards compatibility but is not used.
 
     def create_note(self, title: str, content: str, folder: str, 
                     tags: List[str] = None, note_id: str = None,
@@ -200,14 +138,8 @@ class OperationsService:
             if not found:
                 return {"status": "error", "message": f"Parent note with ID '{parent_id}' not found"}
         
-        # Use global folder if set (access via notebook module, not local copy)
-        try:
-            from . import notebook as _nb_mod  # pylint: disable=import-outside-toplevel
-            if _nb_mod._initialized and _nb_mod._notebook_folder is not None:
-                self.nb.folder = Path(_nb_mod._notebook_folder)
-        except (ImportError, AttributeError):
-            pass
-        
+        # Note: self.nb.folder is already set from create_notebook() which uses the session's folder
+        # No need to check _notebook_folder lambda anymore
         ensure_ready(Path(self.nb.folder), subfolder=folder)
         
         now = datetime.now(timezone.utc)
@@ -235,6 +167,8 @@ class OperationsService:
         
         self.update_index(folder)
         self.write_root_index()
+        # Ensure git is initialized before committing
+        self.nb._git_init()
         self.nb._git_commit(f"Add note: {title} ({ts_id})")
         
         result = {

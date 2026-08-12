@@ -35,11 +35,17 @@ File Naming: {YYYYMMDDHHmmss}_{slug}.md
 from .notebook import (  # noqa: F401,F403
     Notebook,
     create_notebook,
+    init_session,
+    reinit_session,
+    get_session,
+    list_sessions,
+    close_session,
     DEBUG,
     _initialized,
     _notebook_folder,
     _selection_store,
     _selection_counter,
+    MAX_SESSIONS,
 )
 
 # Re-export VALID_FOLDERS from utils for backwards compatibility
@@ -48,10 +54,16 @@ from .utils import VALID_FOLDERS  # noqa: F401
 __all__ = [
     "Notebook",
     "create_notebook",
+    "init_session",
+    "reinit_session",
+    "get_session",
+    "list_sessions",
+    "close_session",
     "VALID_FOLDERS",
     "DEBUG",
     "_initialized",
     "_notebook_folder",
     "_selection_store",
     "_selection_counter",
+    "MAX_SESSIONS",
 ]

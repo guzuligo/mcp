@@ -43,27 +43,28 @@ except ImportError:
 # Import from modular package — GLOBALS ARE REFERENCES, NOT COPIES
 # ============================================================================
 # All global state lives in notebook.py. We import by reference so there is
-# exactly ONE copy of each variable. When init_notebook sets _initialized=True
-# in notebook.py, lmnotes.py sees the same change automatically.
+# exactly ONE copy of each variable. When init_session sets a session in
+# notebook.py, lmnotes.py sees the same change automatically.
 
 from lmnotes import notebook as _nb  # noqa: E402
 from lmnotes.notebook import (
     Notebook,
     create_notebook,
+    init_session,
+    reinit_session,
+    get_session,
+    list_sessions,
+    close_session,
     DEBUG,
     VALID_FOLDERS,
+    MAX_SESSIONS,
 )
-# These are LIVE REFERENCES to notebook.py's module variables
-_initialized = _nb._initialized
-_notebook_folder = _nb._notebook_folder
+
+# LIVE REFERENCES to notebook.py's module variables (functions, not values)
+_initialized = _nb._initialized  # lambda function
+_notebook_folder = _nb._notebook_folder  # lambda function
 _selection_store = _nb._selection_store
 _selection_counter = _nb._selection_counter
-
-# ============================================================================
-# Global State (references to notebook.py — no duplicates)
-# ============================================================================
-# _initialized, _notebook_folder, _selection_store, _selection_counter
-# are imported above by reference. Do NOT redefine them here.
 
 _mcp_instance = None
 
@@ -110,28 +111,91 @@ mcp = _get_mcp()
 
 
 # ============================================================================
-# MCP Tools (21 tools with full docstrings)
+# MCP Tools (27 tools with full docstrings)
 # ============================================================================
 
 @mcp.tool
 def lmnotes_init_notebook(folder: str = "") -> str:
-    """Initialize or reconfigure the notebook folder location.
+    """Initialize a new session with the given notebook folder.
 
-    Sets a global reference so all subsequent tool calls use this folder.
-    Only creates the root directory if it doesn't exist. Subfolders are
-    created lazily on first write.
+    Creates a new session (001, 002, etc.) with its own notebook folder.
+    All subsequent tool calls will use this session's folder until
+    another session is created or the session is reinitialized.
+    
+    Session IDs are 3-digit strings (001-999). Max 999 concurrent sessions.
+    Sessions are ephemeral (lost when Python process restarts).
 
     Args:
         folder: Path to use as notebook root. If ends with '/', appends .lmnotes/.
                 If empty or omitted, uses default ~/.lmnotes/
 
     Returns:
-        JSON with status and resolved path.
+        JSON with status, session_id, and resolved path.
     """
-    # NOTE: We CANNOT use create_notebook() here because it requires _initialized=True.
-    # init_notebook is what SETS _initialized=True, so we must bypass create_notebook()
-    # and directly create a Notebook instance.
-    return _tool_run(lambda f=folder: Notebook(f).init_notebook(f if f else None))
+    result = init_session(folder if folder else None)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool
+def lmnotes_reinit_session(session_id: str, folder: str = "") -> str:
+    """Reinitialize an existing session with a new folder.
+
+    Changes the notebook folder for the specified session and switches
+    to that session. The session_id remains the same.
+
+    Args:
+        session_id: The session to reinitialize (e.g., "001", "042")
+        folder: New notebook folder path. If empty, uses default ~/.lmnotes/
+
+    Returns:
+        JSON with status, session_id, and new folder path.
+    """
+    result = reinit_session(session_id, folder if folder else None)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool
+def lmnotes_get_session() -> str:
+    """Return the current session information.
+
+    Returns the active session ID and its associated notebook folder.
+
+    Returns:
+        JSON with session_id, folder, and status.
+    """
+    result = get_session()
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool
+def lmnotes_list_sessions() -> str:
+    """List all active sessions with their folders.
+
+    Returns a list of all sessions (001-999) with their notebook folders
+    and indicates which one is currently active.
+
+    Returns:
+        JSON with sessions list, current session, and counts.
+    """
+    result = list_sessions()
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool
+def lmnotes_close_session(session_id: str) -> str:
+    """Close a session and free its slot.
+
+    Removes the specified session. If the closed session was the active one,
+    the current session is reset to "000" (no session).
+
+    Args:
+        session_id: The session to close (e.g., "001", "042")
+
+    Returns:
+        JSON with status and message.
+    """
+    result = close_session(session_id)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool
@@ -570,7 +634,14 @@ if __name__ == "__main__":
 
     print("=" * 50)
     print("Available tools:")
-    print("  lmnotes_init_notebook      - Initialize or reconfigure notebook folder")
+    print("Session Management:")
+    print("  lmnotes_init_notebook      - Initialize a new session (001-999)")
+    print("  lmnotes_reinit_session     - Reinitialize session with new folder")
+    print("  lmnotes_get_session        - Get current session info")
+    print("  lmnotes_list_sessions      - List all active sessions")
+    print("  lmnotes_close_session      - Close a session")
+    print()
+    print("Note Operations:")
     print("  lmnotes_create_note        - Create a new note")
     print("  lmnotes_read_note          - Read a note by ID")
     print("  lmnotes_search_notes       - Search notes with keyword ranking")

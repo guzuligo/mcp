@@ -56,9 +56,13 @@ class Notebook:
 
     # -- Git helpers (internal) --
 
-    def _git_init(self) -> None:
-        """Initialize git repo. Safe to call repeatedly."""
-        self._versioning.git_init()
+    def _git_init(self) -> bool:
+        """Initialize git repo. Safe to call repeatedly.
+        
+        Returns:
+            True if git was initialized, False if it already existed or failed.
+        """
+        return self._versioning.git_init()
 
     def _git_commit(self, message: str) -> dict:
         """Stage and commit all changes."""
@@ -89,8 +93,12 @@ class Notebook:
     # -- Public CRUD operations --
 
     def init_notebook(self, folder: str = None) -> dict:
-        """Initialize or reconfigure the notebook folder location."""
-        return self._operations.init_notebook(folder)
+        """Initialize or reconfigure the notebook folder location.
+        
+        This now uses the session-based system. Creates a new session
+        (001, 002, etc.) with the given folder.
+        """
+        return init_session(folder)
 
     def create_note(self, title: str, content: str, folder: str, 
                     tags: list = None, note_id: str = None,
@@ -270,45 +278,204 @@ class Notebook:
 # Global State & Factory
 # ============================================================================
 
-_initialized: bool = False
-_notebook_folder: Optional[str] = None
+# Session management (ephemeral, in-memory only)
+# Sessions are 3-digit strings: "000" = no session, "001"-"999" = active sessions
+_current_session: str = "000"
+_session_counter: int = 0
+_sessions: dict = {}  # session_id -> {"folder": str}
+MAX_SESSIONS: int = 999
+
+# Backwards compatibility aliases (for existing code that references these)
+_initialized = lambda: _current_session != "000"  # Function, not value
+_notebook_folder = lambda: _sessions.get(_current_session, {}).get("folder")  # Function
+
 _selection_store: dict = {}
 _selection_counter = 0
 DEBUG = True
 VALID_FOLDERS = ["procedures", "reports", "individuals", "conversations", "knowledge", "system", "references"]
 
 
-def create_notebook(folder: str = None) -> Optional["Notebook"]:
-    """Create a Notebook instance with the given folder or global default.
+def _generate_session_id() -> str:
+    """Generate next 3-digit session ID (001, 002, ..., 999)."""
+    global _session_counter  # pylint: disable=global-statement
+    _session_counter += 1
+    return f"{_session_counter:03d}"
+
+
+def init_session(folder: str = None) -> dict:
+    """Create a new session with the given notebook folder.
     
-    Only returns an instance if init_notebook has been called (setting _notebook_folder).
-    Returns None if not initialized.
+    Creates a new session (001, 002, etc.) with its own notebook folder.
+    Creates the root directory and index.md if they don't exist.
+    When max sessions (999) is reached, returns an error.
+    Session IDs are 3-digit strings: "001", "002", etc.
+    
+    Args:
+        folder: Notebook folder path. If None, uses ~/.lmnotes/
+        
+    Returns:
+        dict with session_id, folder path, and status
     """
-    global _initialized, _notebook_folder  # pylint: disable=global-statement
+    global _current_session, _sessions  # pylint: disable=global-statement
     
-    # Check our own module state first
-    if not _initialized:
+    if _session_counter >= MAX_SESSIONS:
+        return {"status": "error", "message": f"Maximum sessions ({MAX_SESSIONS}) reached. Close some sessions first."}
+    
+    session_id = _generate_session_id()
+    # Import resolve_folder from utils
+    from lmnotes.utils import resolve_folder, ensure_ready  # pylint: disable=import-outside-toplevel
+    from pathlib import Path  # pylint: disable=import-outside-toplevel
+    
+    resolved_folder = str(resolve_folder(folder))
+    root = Path(resolved_folder)
+    
+    # Create root directory and index.md if they don't exist
+    if not root.exists():
+        root.mkdir(parents=True, exist_ok=True)
+    
+    # Create root index.md if it doesn't exist
+    index_path = root / "index.md"
+    if not index_path.exists():
+        from lmnotes.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
+        content = "# LMNotes - Root Index\n\n## Categories\n\n"
+        for fldr in VALID_FOLDERS:
+            folder_path = root / fldr
+            if folder_path.exists():
+                count = len(list(folder_path.glob("*.md"))) - 1
+                content += f"- **{fldr}** ({count} notes)\n"
+        content += "\n---\n\n*Use `search_notes` to find specific content.*\n"
+        index_path.write_text(content, encoding="utf-8")
+    
+    _sessions[session_id] = {"folder": resolved_folder}
+    _current_session = session_id
+    
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "folder": resolved_folder,
+        "message": f"Session {session_id} created"
+    }
+
+
+def reinit_session(session_id: str, folder: str = None) -> dict:
+    """Reinitialize an existing session with a new folder.
+    
+    Changes the notebook folder for the specified session and switches
+    to that session. The session_id remains the same.
+    
+    Args:
+        session_id: The session to reinitialize (e.g., "001")
+        folder: New notebook folder path. If None, uses ~/.lmnotes/
+        
+    Returns:
+        dict with session_id, folder path, and status
+    """
+    global _current_session, _sessions  # pylint: disable=global-statement
+    
+    if session_id not in _sessions:
+        return {"status": "error", "message": f"Session {session_id} not found."}
+    
+    from lmnotes.utils import resolve_folder  # pylint: disable=import-outside-toplevel
+    resolved_folder = str(resolve_folder(folder))
+    _sessions[session_id]["folder"] = resolved_folder
+    _current_session = session_id
+    
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "folder": resolved_folder,
+        "message": f"Session {session_id} reinitialized to {resolved_folder}"
+    }
+
+
+def get_session() -> dict:
+    """Return the current session information.
+    
+    Returns:
+        dict with session_id, folder, and status
+    """
+    global _current_session, _sessions  # pylint: disable=global-statement
+    
+    if _current_session == "000" or _current_session not in _sessions:
+        return {"status": "no_session", "session_id": "000", "message": "No active session"}
+    
+    return {
+        "status": "success",
+        "session_id": _current_session,
+        "folder": _sessions[_current_session]["folder"]
+    }
+
+
+def list_sessions() -> dict:
+    """List all active sessions with their folders.
+    
+    Returns:
+        dict with sessions list and status
+    """
+    global _sessions  # pylint: disable=global-statement
+    
+    sessions_list = []
+    for sid, data in sorted(_sessions.items()):
+        sessions_list.append({
+            "session_id": sid,
+            "folder": data["folder"],
+            "is_current": sid == _current_session
+        })
+    
+    return {
+        "status": "success",
+        "current_session": _current_session,
+        "total_sessions": len(_sessions),
+        "max_sessions": MAX_SESSIONS,
+        "sessions": sessions_list
+    }
+
+
+def close_session(session_id: str) -> dict:
+    """Close a session and free its slot.
+    
+    Args:
+        session_id: The session to close (e.g., "001")
+        
+    Returns:
+        dict with status and message
+    """
+    global _current_session, _sessions  # pylint: disable=global-statement
+    
+    if session_id not in _sessions:
+        return {"status": "error", "message": f"Session {session_id} not found."}
+    
+    del _sessions[session_id]
+    
+    # If we're closing the current session, reset to 000
+    if _current_session == session_id:
+        _current_session = "000"
+    
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "message": f"Session {session_id} closed"
+    }
+
+
+def create_notebook(folder: str = None) -> Optional["Notebook"]:
+    """Create a Notebook instance from the current session's folder.
+    
+    Only returns an instance if a session is active.
+    Returns None if no session is active.
+    
+    A fresh Notebook instance is created each time, but it uses the
+    folder path stored in the current session. This is ephemeral —
+    if the Python process restarts, all session state is lost.
+    """
+    global _current_session, _sessions  # pylint: disable=global-statement
+    
+    # Check if a session is active
+    if _current_session == "000" or _current_session not in _sessions:
         return None
     
-    # Also verify parent lmnotes module agrees — catches test-side resets
-    try:
-        import lmnotes as _lmn  # pylint: disable=import-outside-toplevel
-        if not getattr(_lmn, '_initialized', False):
-            return None
-    except (ImportError, AttributeError):
-        pass
-    
-    # Use our own _notebook_folder if available, otherwise try parent
+    # Use the session's folder, or the provided folder override
     if folder is None:
-        if _notebook_folder is not None:
-            folder = _notebook_folder
-        else:
-            try:
-                import lmnotes as _lmn2  # pylint: disable=import-outside-toplevel
-                folder = getattr(_lmn2, '_notebook_folder', None)
-            except (ImportError, AttributeError):
-                pass
+        folder = _sessions[_current_session]["folder"]
     
-    if folder is None and not _initialized:
-        pass
     return Notebook(folder)

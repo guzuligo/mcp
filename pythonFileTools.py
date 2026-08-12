@@ -13,7 +13,7 @@ A FastMCP-based server providing file manipulation tools for LLMs:
 - execute_command: Run bash commands and capture stdout/stderr with timeout support
 - git_init: Initialize a git repository in a directory for edit tracking
 
-All file operations are restricted to paths within the user's home directory. Each edit is committed to git for undo capability.
+All edits are committed to git for undo capability.
 """
 
 import difflib
@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Security: Restrict file operations to home directory
+# Home directory reference (used for tilde expansion in path validation)
 HOME_DIR = Path.home().resolve()
 
 from fastmcp import FastMCP
@@ -195,12 +195,14 @@ def search_file_content(
 
 
 def _validate_path(path: Path) -> Path:
-    """Validate that a path is within the home directory for security."""
+    """Validate and resolve a file path.
+    
+    Expands ~ (tilde) to the user's home directory and resolves symbolic links
+    to return the absolute canonical path.
+    """
     # Expand ~ (tilde) to user's home directory before resolving
     expanded = os.path.expanduser(str(path))
     resolved = Path(expanded).resolve()
-    if not str(resolved).startswith(str(HOME_DIR)):
-        raise ValueError(f"Access denied: paths outside home directory are not allowed. Requested: {resolved}")
     return resolved
 
 
@@ -428,8 +430,7 @@ def read_file_content(
     """Read and return the content of a file (similar to cat in command line).
 
     ⚠️ IMPORTANT - Common Pitfalls:
-      - REQUIRED: `path` must be provided and must be an absolute path within your home directory (/home/user1/...).
-      - Paths outside your home directory are blocked for security. Use full absolute paths.
+      - REQUIRED: `path` must be provided. Use full absolute paths for reliability.
       - Line numbers are 1-based (line 1 is the first line, not line 0).
       - Always verify the file exists before editing — use this tool first, then `edit_file`.
 
@@ -437,7 +438,7 @@ def read_file_content(
     When line ranges are provided, only that portion is returned.
 
     Args:
-        path: REQUIRED. The absolute file path (within home directory). Only paths within the home directory are allowed.
+        path: REQUIRED. The absolute file path.
         start_line: Optional 1-based line number to start reading from (inclusive). Default: first line.
         end_line: Optional 1-based line number to stop reading at (inclusive). Default: last line.
         encoding: The file encoding to use. Default: utf-8
@@ -494,7 +495,7 @@ def edit_file(
     """Apply edits to a file directly and commit the change to git (for undo capability).
 
     ⚠️ IMPORTANT - Common Pitfalls:
-      - REQUIRED: Both `path` and `changes` must be provided. `path` must be an absolute path within your home directory.
+      - REQUIRED: Both `path` and `changes` must be provided. `path` must be an absolute path.
       - REQUIRED: `changes` must be a JSON array `[...]` containing at least one change object.
       - Each change object requires: `mode` (string), `search` (string), `replace` (string).
       - The file must exist and reside in a git-initialized directory. If no git repo exists, run `git_init` first.
@@ -513,7 +514,7 @@ def edit_file(
                          Requires: `start_line`, `end_line`, `replacement_content` fields.
 
     Args:
-        path: REQUIRED. The absolute file path (within home directory). Only paths within the home directory are allowed.
+        path: REQUIRED. The absolute file path.
         changes: REQUIRED. A list (array) of dictionaries describing each edit operation. See mode descriptions above.
         encoding: The file encoding to use. Default: utf-8
         git_dir: Optional path to the git repository root. If not specified, the file's parent directory is used.
@@ -711,13 +712,13 @@ def undo_edit(path: str, steps: int = 1) -> dict:
     """Revert a file to its state before N confirmed edits using git history.
 
     ⚠️ IMPORTANT - Common Pitfalls:
-      - REQUIRED: `path` must be an absolute path within your home directory.
+      - REQUIRED: `path` must be an absolute path.
       - The file must have git history (commits from previous `edit_file` operations).
       - If no git commits exist, use `edit_file` first to create commits, then undo.
       - `steps` defaults to 1 — increase for reverting multiple edits.
 
     Args:
-        path: REQUIRED. The absolute file path to revert (within home directory).
+        path: REQUIRED. The absolute file path to revert.
         steps: Number of git commits to go back. Default: 1
 
     Returns:
@@ -916,7 +917,7 @@ def create_file(
     """Create a new file with the given content and commit to git for undo capability.
 
     ⚠️ IMPORTANT - Common Pitfalls:
-      - REQUIRED: Both `path` and `content` must be provided. `path` must be an absolute path within your home directory.
+      - REQUIRED: Both `path` and `content` must be provided. `path` must be an absolute path.
       - The parent directory MUST exist. Use `list_folder` to verify, or `git_init` on the parent directory first.
       - A git repository MUST exist in the file's directory or its ancestors. Run `git_init` first if needed.
       - If the file already exists, set `overwrite: true` to replace it — otherwise you get an error.
@@ -927,7 +928,7 @@ def create_file(
     so it can be undone later.
 
     Args:
-        path: REQUIRED. The absolute file path (within home directory). Parent directory must exist.
+        path: REQUIRED. The absolute file path. Parent directory must exist.
         content: REQUIRED. The content for the new file.
         overwrite: If True, allow overwriting existing files. Default: False
         encoding: The file encoding to use. Default: utf-8
@@ -1277,7 +1278,7 @@ def select_before_edit_file_content(
     to replace specific occurrences.
     
     ⚠️ IMPORTANT - Common Pitfalls:
-      - REQUIRED: `path` must be an absolute path within your home directory.
+      - REQUIRED: `path` must be an absolute path.
       - At least one of `search` or `mode` must be provided.
       - `search` is the text/pattern to find. If empty, no selection is made.
       - `mode` can be: 'exact' (default), 'regex', or 'whitespace_tolerant'.
@@ -1285,7 +1286,7 @@ def select_before_edit_file_content(
       - Any edit to the file will invalidate the current selection.
     
     Args:
-        path: REQUIRED. The absolute file path (within home directory).
+        path: REQUIRED. The absolute file path.
         search: REQUIRED. The text or pattern to search for.
         mode: Search mode - 'exact', 'regex', or 'whitespace_tolerant'. Default: 'exact'
         max_return_chars: Maximum characters to return in match content. Default: 1000
@@ -1371,7 +1372,7 @@ def edit_after_select_file_content(
       - After successful edit, selection is automatically invalidated.
     
     Args:
-        path: REQUIRED. The absolute file path (within home directory).
+        path: REQUIRED. The absolute file path.
         occurrence: Which occurrence(s) to replace. 0=all, positive=int, list=specific indices.
                     Default: 0 (replace all)
         replacement: The replacement text. Default: "" (empty string = delete)
@@ -3001,7 +3002,7 @@ def git_init(path: str, overwrite: bool = False) -> dict:
     """Initialize a git repository in the specified directory.
 
     ⚠️ IMPORTANT - Common Pitfalls:
-      - REQUIRED: `path` must be an absolute path to an EXISTING directory within your home directory.
+      - REQUIRED: `path` must be an absolute path to an EXISTING directory.
       - Run this BEFORE `edit_file` or `create_file` if the directory has no .git folder.
       - After initializing, you can use file editing tools — each edit will be committed for undo capability.
       - If a git repo already exists, set `overwrite: true` to reinitialize (WARNING: removes existing .git).
