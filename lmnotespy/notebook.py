@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from lmnotes.operations import OperationsService
-    from lmnotes.edits import EditService
-    from lmnotes.versioning import GitService
+    from lmnotespy.operations import OperationsService
+    from lmnotespy.edits import EditService
+    from lmnotespy.versioning import GitService
 
 
 class Notebook:
@@ -26,9 +26,9 @@ class Notebook:
         self.folder = self._resolve_folder(folder)
         # Services are created with `self` — no import-time binding
         # Import here to avoid circular dependency at class definition time
-        from lmnotes.operations import OperationsService  # pylint: disable=import-outside-toplevel
-        from lmnotes.edits import EditService  # pylint: disable=import-outside-toplevel
-        from lmnotes.versioning import GitService  # pylint: disable=import-outside-toplevel
+        from lmnotespy.operations import OperationsService  # pylint: disable=import-outside-toplevel
+        from lmnotespy.edits import EditService  # pylint: disable=import-outside-toplevel
+        from lmnotespy.versioning import GitService  # pylint: disable=import-outside-toplevel
         
         self._operations = OperationsService(self)
         self._edits = EditService(self)
@@ -38,12 +38,12 @@ class Notebook:
     def _resolve_folder(folder: str = None) -> Path:
         """Resolve the notebook folder path from argument or default."""
         # pylint: disable=import-outside-toplevel
-        from lmnotes.utils import resolve_folder
+        from lmnotespy.utils import resolve_folder
         return resolve_folder(folder)
 
     def _ensure_ready(self, subfolder: str = None) -> None:
         """Ensure the notebook root and optionally a subfolder exist."""
-        from lmnotes.utils import ensure_ready  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import ensure_ready  # pylint: disable=import-outside-toplevel
         ensure_ready(Path(self.folder), subfolder)
 
     def _ensure_initialized(self) -> None:
@@ -191,6 +191,15 @@ class Notebook:
         """Copy a file to the references folder."""
         return self._edits.copy_to_references(source_path, description, note_id)
 
+    def move_note(self, note_id: str, destination_folder: str, 
+                  new_title: str = None) -> dict:
+        """Move a note to a different folder.
+        
+        Creates a new note in the destination folder, re-parents children,
+        and writes a redirect stub in the old location.
+        """
+        return self._edits.move_note(note_id, destination_folder, new_title)
+
     # -- Git public tools --
 
     def git_log(self, note_id: str) -> dict:
@@ -237,9 +246,9 @@ class Notebook:
         """Load manual.md from the lmnotes package directory."""
         try:
             import importlib.resources as pkg_resources  # Python 3.9+
-            content = pkg_resources.read_text("lmnotes", "manual.md")
+            content = pkg_resources.read_text("lmnotespy", "manual.md")
             return content
-        except (ImportError, AttributeError):
+        except (ImportError, AttributeError, FileNotFoundError):
             # Fallback: read from filesystem relative to this module
             pass
         
@@ -278,204 +287,122 @@ class Notebook:
 # Global State & Factory
 # ============================================================================
 
-# Session management (ephemeral, in-memory only)
-# Sessions are 3-digit strings: "000" = no session, "001"-"999" = active sessions
-_current_session: str = "000"
-_session_counter: int = 0
-_sessions: dict = {}  # session_id -> {"folder": str}
-MAX_SESSIONS: int = 999
+from lmnotespy import sessions as _sess  # noqa: E402
 
-# Backwards compatibility aliases (for existing code that references these)
-_initialized = lambda: _current_session != "000"  # Function, not value
-_notebook_folder = lambda: _sessions.get(_current_session, {}).get("folder")  # Function
+_DEBUG = True
+_VALID_FOLDERS = ["procedures", "reports", "individuals", "conversations", "knowledge", "system", "references"]
 
-_selection_store: dict = {}
-_selection_counter = 0
+
+def require_initialized() -> Optional[dict]:
+    """Return an error dict if no session is active, else None."""
+    sid = _sess.get_current_session()
+    if sid is None:
+        return {"status": "error", "message": "No active session. Call lmnotes_init_notebook first."}
+    return None
+
+
 DEBUG = True
 VALID_FOLDERS = ["procedures", "reports", "individuals", "conversations", "knowledge", "system", "references"]
 
-
-def _generate_session_id() -> str:
-    """Generate next 3-digit session ID (001, 002, ..., 999)."""
-    global _session_counter  # pylint: disable=global-statement
-    _session_counter += 1
-    return f"{_session_counter:03d}"
+# Selection store for edit workflow (maps selection_id → selection data)
+_selection_store: dict = {}
+_selection_counter: int = 0
 
 
 def init_session(folder: str = None) -> dict:
     """Create a new session with the given notebook folder.
-    
-    Creates a new session (001, 002, etc.) with its own notebook folder.
+
+    Creates a new session (12-digit timestamp ID) with its own notebook folder.
     Creates the root directory and index.md if they don't exist.
-    When max sessions (999) is reached, returns an error.
-    Session IDs are 3-digit strings: "001", "002", etc.
-    
+
     Args:
         folder: Notebook folder path. If None, uses ~/.lmnotes/
-        
+
     Returns:
         dict with session_id, folder path, and status
     """
-    global _current_session, _sessions  # pylint: disable=global-statement
-    
-    if _session_counter >= MAX_SESSIONS:
-        return {"status": "error", "message": f"Maximum sessions ({MAX_SESSIONS}) reached. Close some sessions first."}
-    
-    session_id = _generate_session_id()
-    # Import resolve_folder from utils
-    from lmnotes.utils import resolve_folder, ensure_ready  # pylint: disable=import-outside-toplevel
+    from lmnotespy.utils import resolve_folder  # pylint: disable=import-outside-toplevel
     from pathlib import Path  # pylint: disable=import-outside-toplevel
-    
+
     resolved_folder = str(resolve_folder(folder))
     root = Path(resolved_folder)
-    
-    # Create root directory and index.md if they don't exist
+
     if not root.exists():
         root.mkdir(parents=True, exist_ok=True)
-    
-    # Create root index.md if it doesn't exist
+
     index_path = root / "index.md"
     if not index_path.exists():
-        from lmnotes.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
         content = "# LMNotes - Root Index\n\n## Categories\n\n"
-        for fldr in VALID_FOLDERS:
+        for fldr in _VALID_FOLDERS:
             folder_path = root / fldr
             if folder_path.exists():
                 count = len(list(folder_path.glob("*.md"))) - 1
                 content += f"- **{fldr}** ({count} notes)\n"
-        content += "\n---\n\n*Use `search_notes` to find specific content.*\n"
+        content += "\n---\n\n*Use search_notes to find specific content.*\n"
         index_path.write_text(content, encoding="utf-8")
-    
-    _sessions[session_id] = {"folder": resolved_folder}
-    _current_session = session_id
-    
+
+    sess_data = _sess.create_session(resolved_folder)
+    _sess.set_current_session(sess_data["id"])
+
     return {
         "status": "success",
-        "session_id": session_id,
+        "session_id": sess_data["id"],
         "folder": resolved_folder,
-        "message": f"Session {session_id} created"
-    }
-
-
-def reinit_session(session_id: str, folder: str = None) -> dict:
-    """Reinitialize an existing session with a new folder.
-    
-    Changes the notebook folder for the specified session and switches
-    to that session. The session_id remains the same.
-    
-    Args:
-        session_id: The session to reinitialize (e.g., "001")
-        folder: New notebook folder path. If None, uses ~/.lmnotes/
-        
-    Returns:
-        dict with session_id, folder path, and status
-    """
-    global _current_session, _sessions  # pylint: disable=global-statement
-    
-    if session_id not in _sessions:
-        return {"status": "error", "message": f"Session {session_id} not found."}
-    
-    from lmnotes.utils import resolve_folder  # pylint: disable=import-outside-toplevel
-    resolved_folder = str(resolve_folder(folder))
-    _sessions[session_id]["folder"] = resolved_folder
-    _current_session = session_id
-    
-    return {
-        "status": "success",
-        "session_id": session_id,
-        "folder": resolved_folder,
-        "message": f"Session {session_id} reinitialized to {resolved_folder}"
+        "message": f"Session {sess_data['id']} created",
     }
 
 
 def get_session() -> dict:
-    """Return the current session information.
-    
-    Returns:
-        dict with session_id, folder, and status
-    """
-    global _current_session, _sessions  # pylint: disable=global-statement
-    
-    if _current_session == "000" or _current_session not in _sessions:
-        return {"status": "no_session", "session_id": "000", "message": "No active session"}
-    
+    """Return the current session information."""
+    info = _sess.get_current_session_info()
+    if info is None:
+        return {"status": "no_session", "session_id": "", "message": "No active session"}
     return {
         "status": "success",
-        "session_id": _current_session,
-        "folder": _sessions[_current_session]["folder"]
+        "session_id": info["id"],
+        "folder": info["folder"],
     }
 
 
 def list_sessions() -> dict:
-    """List all active sessions with their folders.
-    
-    Returns:
-        dict with sessions list and status
-    """
-    global _sessions  # pylint: disable=global-statement
-    
-    sessions_list = []
-    for sid, data in sorted(_sessions.items()):
-        sessions_list.append({
-            "session_id": sid,
-            "folder": data["folder"],
-            "is_current": sid == _current_session
-        })
-    
+    """List all active sessions with their folders."""
+    current = _sess.get_current_session() or ""
+    all_sess = _sess.list_sessions()
+    sessions_list = [
+        {"session_id": s["id"], "folder": s["folder"], "is_current": s["id"] == current}
+        for s in all_sess
+    ]
     return {
         "status": "success",
-        "current_session": _current_session,
-        "total_sessions": len(_sessions),
-        "max_sessions": MAX_SESSIONS,
-        "sessions": sessions_list
+        "current_session": current,
+        "total_sessions": len(sessions_list),
+        "sessions": sessions_list,
     }
 
 
 def close_session(session_id: str) -> dict:
-    """Close a session and free its slot.
-    
-    Args:
-        session_id: The session to close (e.g., "001")
-        
-    Returns:
-        dict with status and message
-    """
-    global _current_session, _sessions  # pylint: disable=global-statement
-    
-    if session_id not in _sessions:
+    """Close a session and free its slot."""
+    if not _sess.delete_session(session_id):
         return {"status": "error", "message": f"Session {session_id} not found."}
-    
-    del _sessions[session_id]
-    
-    # If we're closing the current session, reset to 000
-    if _current_session == session_id:
-        _current_session = "000"
-    
+    if _sess.get_current_session() == session_id:
+        _sess.clear_current_session()
     return {
         "status": "success",
         "session_id": session_id,
-        "message": f"Session {session_id} closed"
+        "message": f"Session {session_id} closed",
     }
 
 
 def create_notebook(folder: str = None) -> Optional["Notebook"]:
     """Create a Notebook instance from the current session's folder.
-    
-    Only returns an instance if a session is active.
-    Returns None if no session is active.
-    
-    A fresh Notebook instance is created each time, but it uses the
-    folder path stored in the current session. This is ephemeral —
-    if the Python process restarts, all session state is lost.
+
+    Only returns an instance if a session is active. Returns None otherwise.
+    Session state persists across process restarts via SQLite.
     """
-    global _current_session, _sessions  # pylint: disable=global-statement
-    
-    # Check if a session is active
-    if _current_session == "000" or _current_session not in _sessions:
+    info = _sess.get_current_session_info()
+    if info is None:
         return None
-    
-    # Use the session's folder, or the provided folder override
     if folder is None:
-        folder = _sessions[_current_session]["folder"]
-    
+        folder = info["folder"]
     return Notebook(folder)

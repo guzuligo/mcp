@@ -6,12 +6,12 @@ making them safe to import without circular import issues.
 """
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from lmnotes.notebook import Notebook
+    from lmnotespy.notebook import Notebook
 
 
 # Valid folder categories
@@ -23,6 +23,38 @@ def generate_id(timestamp: datetime = None) -> str:
     if timestamp is None:
         timestamp = datetime.now(timezone.utc)
     return timestamp.strftime("%y%m%d%H%M%S")
+
+
+def _note_id_in_use(root: Path, ts_id: str) -> bool:
+    """Return True if any file named ``{ts_id}_*.md`` exists under *root*."""
+    for folder_name in VALID_FOLDERS + ["", "."]:
+        search_path = root / folder_name if folder_name else root
+        if not search_path.exists():
+            continue
+        matches = list(search_path.glob(f"{ts_id}_*.md"))
+        valid_matches = [f for f in matches if "_" in f.name and f.name != "index.md"]
+        if valid_matches:
+            return True
+    return False
+
+
+def generate_unique_id(root: Path, timestamp: datetime = None) -> str:
+    """Return a 12-digit timestamp ID not used by any existing note under *root*.
+
+    On collision the ID is incremented by 1 second (same strategy as
+    :func:`lmnotespy.sessions.generate_session_id`).  Raises ``RuntimeError``
+    after 60 attempts.
+    """
+    ts_id = generate_id(timestamp)
+    for offset in range(60):
+        if not _note_id_in_use(root, ts_id):
+            return ts_id
+        # Increment by 1 second and re-format
+        timestamp = (timestamp or datetime.now(timezone.utc)) + timedelta(seconds=offset + 1)
+        ts_id = timestamp.strftime("%y%m%d%H%M%S")
+    raise RuntimeError(
+        f"Unable to generate unique note ID after 60 attempts under {root}"
+    )
 
 
 def make_slug(title: str, note_id: str = "") -> str:

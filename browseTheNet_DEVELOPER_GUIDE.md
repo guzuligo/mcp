@@ -1,289 +1,238 @@
 # WebReader MCP Server — Developer Guide
 
+> **Testing environment (use this venv for tests):** `/home/user2/Documents/workspace/code/venv/bin/python`
+>
+> ```bash
+> # Run the test suite
+> /home/user2/Documents/workspace/code/venv/bin/python -m pytest test_webread.py -v
+> ```
+
 ## Overview
 
-This MCP server provides tools for web browsing and page fetching. It is organized into two categories of tools:
+This MCP server provides **five simple, intuitive web tools**. The design principle:
+*the tool does the hard work (fetching, rendering, cookie dismissal, article
+extraction); the LLM only states what it wants.*
 
-1. **Stateless Tools** — One-shot page fetching, no session management
-2. **Stateful Tools** — Interactive browser sessions with explicit `session_id`
+| Tool | Purpose |
+|------|---------|
+| `webreader_read(url)` | Read a page → clean markdown. **The default tool for reading anything.** |
+| `webreader_search(query)` | Search the web → top results (best-effort). |
+| `webreader_open(url)` | Start an interactive session → returns a `session_id`. |
+| `webreader_act(session_id, action, ...)` | Do one thing in a session (click / fill / navigate / scroll / read / screenshot / go_back / go_forward). |
+| `webreader_close(session_id)` | End a session. |
 
-## Architecture
+For ~90% of tasks you only need `webreader_read(url)`. Use `webreader_open` / `webreader_act` /
+`webreader_close` only when you must click, fill forms, or step through a site.
 
-### Session Registry
+## Content Extraction Strategy
 
-All interactive browsing tools share state through a session registry:
+`webreader_read` (and `webreader_act(action="read")`) extract the real article body:
 
-```python
-_sessions: dict = {}          # session_id -> {browser, context, page, last_activity}
-_sessions_lock = asyncio.Lock()  # Thread-safe access
-_SESSION_TIMEOUT = timedelta(minutes=10)  # Auto-cleanup
+1. **trafilatura** (a battle-tested article extractor) does the primary job —
+   it strips navigation, footers, cookie text, ads and `<style>` noise, and
+   returns clean markdown of the main content.
+2. If trafilatura returns little, a **BeautifulSoup fallback** (`_bs4_extract`)
+   pulls the semantic blocks (`h1–h4`, `p`, `li`, `blockquote`, `pre`) from the
+   main container (`article` / `main` / common content classes).
+
+This is the robust version of the `curl | grep '<p>'` trick that works on
+Webflow / JS-heavy sites — the content is extracted from the semantic markup,
+never from raw `textContent` (which is how navigation and CSS used to leak in).
+
+## Fetching / Escalation
+
+`webreader_read` uses an **auto-escalation pipeline** — the LLM never has to pick a
+mode:
+
+```
+1. HTTP GET (httpx, real browser User-Agent)
+   └─ if it yields a real article → done (method: "http")
+2. otherwise → headless Playwright render:
+       goto → wait for networkidle → dismiss cookie/consent banner → extract
+     (method: "playwright")
+3. if both fail → {"ok": false, "reason", "tried": [...], "hint"}
 ```
 
-Each session entry contains:
-- `browser`: Playwright `Browser` instance (Chromium)
-- `context`: Playwright `BrowserContext` (isolated storage state)
-- `page`: Playwright `Page` object
-- `last_activity`: `datetime` timestamp for expiry tracking
+### Cookie / consent banner handling
 
-### Playwright Lifecycle
+`_dismiss_cookie_banner` best-effort clicks the first visible button among the
+known vendors (OneTrust, Cookiebot, generic "Accept"/"Agree"/"OK"), with a
+JavaScript force-click fallback on the OneTrust handler. This is why cookie
+popups no longer block extraction.
 
-Each session creates its own Playwright instance to avoid the `PlaywrightContextManager` bug:
+## Session Architecture
 
-```python
-# ✅ CORRECT — each session gets its own Playwright instance
-pw = await async_playwright().start()
-browser = await pw.chromium.launch(headless=True)
-context = await browser.new_context()
-page = await context.new_page()
-
-# Store in session registry
-_sessions[session_id] = {
-    "browser": browser,
-    "context": context,
-    "page": page,
-    "last_activity": datetime.now(),
-}
-```
-
-**Never use** `async with async_playwright() as p:` as a context manager inside tools — it calls `p.stop()` on exit, killing all browsers and pages.
-
-## Tool Categories
-
-### Stateless Tools
-
-Each call is fully independent. No session, no persistence.
-
-| Tool | Description |
-|------|-------------|
-| `basic_page_fetch` | Fetch page text via HTTP (fastest). Falls back to Playwright if HTTP fails. |
-| `fetch_page_sections` | Fetch + extract structured, classified sections. |
-| `fetch_page_progressive` | Fetch sections in batches for long pages. |
-| `fetch_page_section_by_id` | Get one section by its ID from `fetch_page_sections`. |
-
-**Implementation pattern:**
-```python
-@mcp.tool()
-async def basic_page_fetch(url: str, force_playwright: bool = False) -> str:
-    # 1. Try HTTP first (if not force_playwright)
-    # 2. If HTTP fails or force_playwright=True, use short-lived Playwright
-    # 3. Always clean up: browser.close() + pw.stop()
-```
-
-### Stateful Tools
-
-Interactive browsing requires an explicit `session_id` from `browser_open()`.
-
-| Tool | Description |
-|------|-------------|
-| `browser_open` | Open URL, returns `session_id` |
-| `browser_navigate` | Navigate within session |
-| `browser_click` | Click element |
-| `browser_fill` | Fill form field |
-| `browser_get_state` | Read page content |
-| `browser_go_back` | Go back in history |
-| `browser_go_forward` | Go forward in history |
-| `browser_screenshot` | Capture screenshot |
-| `browser_close` | Close session |
-
-**Implementation pattern:**
-```python
-@mcp.tool()
-async def browser_click(session_id: str, selector: str) -> str:
-    try:
-        session = _validate_session(session_id)  # Check existence + expiry
-        page = session["page"]
-        
-        # Wait for visibility with fallback
-        try:
-            await page.wait_for_selector(selector, state="visible", timeout=10000)
-        except Exception:
-            pass  # Fall back to direct interaction
-        
-        await page.click(selector)
-        # ... return result
-    except ConnectionError as e:
-        return error_response("not found or expired")
-    except Exception as e:
-        return error_response(str(e))
-```
-
-## Core Functions
-
-### `_validate_session(session_id: str) -> dict`
-
-Checks session existence and expiry. Updates `last_activity` timestamp.
+Interactive sessions live in an in-process registry:
 
 ```python
-def _validate_session(session_id: str) -> dict:
-    if session_id not in _sessions:
-        raise ConnectionError("Session not found. Call browser_open() first.")
-    session = _sessions[session_id]
-    if datetime.now() - session["last_activity"] > _SESSION_TIMEOUT:
-        asyncio.create_task(_destroy_session(session_id, "expired"))
-        raise ConnectionError("Session expired (10 min idle).")
-    session["last_activity"] = datetime.now()
-    return session
+_sessions: dict = {}                 # session_id -> {pw, browser, ctx, page, last}
+_sessions_lock = asyncio.Lock()      # protects the registry
+_SESSION_TIMEOUT = timedelta(minutes=15)
 ```
 
-### `_destroy_session(session_id: str, reason: str)`
+- `webreader_open` creates one Playwright instance + browser + context + page and
+  stores it under a fresh `session_id`.
+- `webreader_act` looks the session up (`_get_session`), refreshes `last`, and runs
+  the action. Unknown/expired sessions raise a clear `ValueError`.
+- `webreader_close` (`_destroy_session`) pops the entry and closes browser +
+  Playwright. Closing an unknown id is a safe no-op.
+- Sessions expire after 15 min idle.
 
-Closes page, context, browser and removes from registry. Thread-safe via `_sessions_lock`.
+### Playwright lifecycle rule
 
-### `_cleanup_expired_sessions()`
+Each session owns its **own** Playwright instance (`pw = await
+async_playwright().start()`). Do **not** use `async with async_playwright() as
+p:` around session tools — that calls `p.stop()` on exit and kills the browser.
 
-Background task to remove idle sessions. Called at the start of `browser_open()`.
+## Tool Reference
+
+### `webreader_read(url, max_chars=20000)`
+
+One-shot read. Returns JSON:
+`{"ok": true, "title", "url", "content" (markdown), "method"}` on success, or
+`{"ok": false, "reason", "tried": [...], "hint"}` on failure.
+
+### `webreader_search(query, max_results=5)`
+
+Best-effort DuckDuckGo HTML search (no API key). Returns
+`{"ok": true, "query", "results": [{title, url, snippet}]}`. If the endpoint is
+blocked or its layout changes it returns `ok: false` with a reason rather than
+crashing. **Lowest-priority tool** — by design it degrades gracefully.
+
+### `webreader_open(url)`
+
+Opens a page in a session, dismisses banners, returns
+`{"ok": true, "session_id", "title", "url", "preview", "hint"}`.
+
+### `webreader_act(session_id, action, selector=None, value=None, url=None, path=None, direction=None, pixels=800, full_page=False, max_dim=768, quality=80)`
+
+| action | params | result |
+|--------|--------|--------|
+| `click` | `selector` (CSS **or** visible text) | `{ok, action, url, strategy}` — hidden/dropdown-tolerant (see below) |
+| `fill` | `selector`, `value` | `{ok, action, url}` |
+| `navigate` | `url` | `{ok, action, url, title, preview}` |
+| `scroll` | `direction` = up\|down\|top\|bottom, `pixels` (default 800) | `{ok, action, direction}` |
+| `read` | — | `{ok, title, url, content, method}` |
+| `screenshot` | `path` / `full_page` / `max_dim` (default 768) / `quality` (default 80) all optional | content blocks `[Image, Text]` (see below) |
+| `go_back` / `go_forward` | — | `{ok, action, url}` |
+
+`_as_selector` transparently accepts a plain visible-text label (wrapped as
+`text=...`) or a raw CSS selector.
+
+**Click is hidden/dropdown-tolerant** (`_robust_click`). It tries, in order:
+1. normal click (element must be visible),
+2. **force** click (element is in the DOM but hidden),
+3. raw JS `el.click()` (bypasses actionability checks).
+
+The `strategy` field reports which one worked. If all fail (the element only
+exists after hover, i.e. it isn't in the DOM yet), it raises a `ValueError`
+telling you to `navigate` directly to the URL.
+
+**Screenshots return content blocks** so the LLM actually *sees* the image
+(the same `ImageContent`-block design the old `webreader_browser_screenshot`
+used — a base64 string inside JSON is NOT visible to the LLM):
+
+```
+[ ImageContent(type="image", data="<base64>", mimeType="image/jpeg"),
+  TextContent(type="text", text='{"ok": true, "action": "screenshot", "path": "/tmp/webreader_<sid>.jpg", "mime": "image/jpeg", "size_bytes": 87000}') ]
+```
+
+The image is **also always saved to a file** (temp path by default, or `path=`)
+as a fallback. **Sizing is bounded by design:**
+- `max_dim` (default **768**, clamped 100–4096) caps the longest side.
+- `quality` (default **80**) is the JPEG quality.
+- `_MAX_INLINE_BYTES` (**1.5 MB**) is a hard cap on the inline payload. If the
+  first compression pass exceeds it, a second, more aggressive pass runs
+  (half the max_dim, quality 50). If it *still* exceeds the cap, the tool
+  falls back to a JSON **string** with the saved `path` + a `hint` — instead of
+  embedding a broken giant image. The saved file is always written.
+
+Typical viewport shot: **~50–150 KB** (768px, JPEG q80). A 4K source or a tall
+`full_page` shot both get scaled down to ≤768px before encoding.
+`full_page=True` captures the whole scrollable page. (Verified against
+fastmcp 3.3.1: a mixed tool may return content blocks for `screenshot` and a
+JSON string for every other action.)
+
+### `webreader_close(session_id)`
+
+Ends the session. `{ok, action, "close", session_id}`.
+
+## Response Contract
+
+All tools return JSON with an `ok` boolean. Success carries the payload;
+failure carries a human-readable `reason` (and a `hint` for `webreader_read`) so an
+LLM can react instead of guessing. This replaces the old free-form error strings.
 
 ## Adding a New Tool
 
-### Stateless Tool
-
 ```python
 @mcp.tool()
-async def my_new_tool(url: str, force_playwright: bool = False) -> str:
-    """Docstring explaining this is STATELESS, ONE-SHOT."""
-    # Use short-lived Playwright or httpx
-    pw = await async_playwright().start()
-    browser = None
-    try:
-        browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page()
-        # ... do work
-        return json.dumps({"status": "success", ...}, indent=2)
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)}, indent=2)
-    finally:
-        if browser:
-            await browser.close()
-        await pw.stop()
+async def my_tool(url: str) -> str:
+    """One line: what it does and when to use it. Keep the surface minimal."""
+    # Reuse the shared helpers:
+    #   _fetch_http(url)          -> (status, html)
+    #   _render_playwright(url)   -> (html, title)
+    #   _extract_article(html)    -> (content, title)
+    #   _dismiss_cookie_banner(page)
+    #   _sessions / _get_session / _destroy_session  (for interactive tools)
+    ...
+    return json.dumps({"ok": True, ...}, ensure_ascii=False)
 ```
 
-### Stateful Tool
-
-```python
-@mcp.tool()
-async def my_new_browser_tool(session_id: str, ...args) -> str:
-    """Docstring explaining this requires session_id from browser_open()."""
-    try:
-        session = _validate_session(session_id)
-        page = session["page"]
-        # ... do work on page
-        return json.dumps({
-            "tool": "my_new_browser_tool",
-            "status": "success",
-            "session_id": session_id,
-            ...
-        }, indent=2)
-    except ConnectionError as e:
-        return json.dumps({
-            "tool": "my_new_browser_tool",
-            "status": "error",
-            "message": str(e)
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({
-            "tool": "my_new_browser_tool",
-            "status": "error",
-            "session_id": session_id,
-            "message": str(e)
-        }, indent=2)
-```
+**Prefer extending an existing tool over adding a new one.** Every extra tool
+adds surface area an LLM can pick wrongly. If two tools differ only by a flag,
+merge them and let the tool decide internally.
 
 ## Best Practices
 
-### Page Loading
+- **Auto-escalate, don't ask the LLM to.** A `force_playwright`-style flag is a
+  smell — it pushes implementation choice onto the caller. Decide internally.
+- **Extract from semantic markup**, never raw `textContent` (avoids CSS/nav).
+- **Return a uniform `{ok, ...}` contract** with actionable `reason`/`hint`.
+- **Dismiss cookie banners** before extracting on interactive/open flows.
+- **Each session owns its Playwright instance**; always close browser + pw.
 
-Always use `domcontentloaded` instead of `networkidle`:
-
-```python
-try:
-    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-except Exception:
-    try:
-        await page.goto(url, timeout=15000)  # Fallback: no wait strategy
-    except Exception:
-        pass
-```
-
-### Element Interaction
-
-Always wait for visibility with fallback:
-
-```python
-try:
-    await page.wait_for_selector(selector, state="visible", timeout=10000)
-except Exception:
-    pass  # Element may exist but be hidden
-await page.click(selector)  # or page.fill()
-```
-
-### Error Handling
-
-Always return JSON with `"status": "success"` or `"status": "error"`. Include helpful `"message"` and `"next_steps"` fields for LLMs.
-
-### Session Expiry
-
-10 minutes is a reasonable default. Adjust `_SESSION_TIMEOUT` if needed:
-
-```python
-_SESSION_TIMEOUT = timedelta(minutes=30)  # Longer sessions
-```
-
-## Testing
-
-### Manual Testing Workflow
-
-```python
-# 1. Stateless tools
-basic_page_fetch("https://example.com")
-fetch_page_sections("https://example.com/article")
-
-# 2. Stateful tools
-result = browser_open("https://example.com")
-session_id = result["session_id"]
-
-browser_get_state(session_id=session_id)
-browser_click(session_id=session_id, selector="#link")
-browser_get_state(session_id=session_id)  # Check changes
-browser_close(session_id=session_id)
-```
-
-### Common Issues
+## Common Issues
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| `PlaywrightContextManager object has no attribute 'chromium'` | Using `async with async_playwright()` context manager | Use `pw = await async_playwright().start()` |
-| `Target page, context or browser has been closed` | Session expired or never created | Check `_validate_session()` and session expiry |
-| Click timeout on generic selectors | Element not visible or wrong selector | Use specific selectors, add visibility wait with fallback |
-| `networkidle` hangs | Third-party resources never settle | Use `domcontentloaded` |
+| CSS / nav text in output | extracting from `textContent` | use `_extract_article` (trafilatura/bs4 semantic extraction) |
+| Cookie banner blocks content | banner not dismissed | `_dismiss_cookie_banner` runs in `_render_playwright` / `webreader_open` |
+| JS-heavy page empty over HTTP | content rendered client-side | auto-escalation to Playwright in `webreader_read` |
+| `unknown session_id` | session closed/expired | call `webreader_open` again to get a fresh id |
+| `PlaywrightContextManager ... 'chromium'` | used `async with async_playwright()` in a session tool | use `pw = await async_playwright().start()` |
+| `click` times out on a hidden/dropdown element | element not visible / not in DOM | `_robust_click` already falls back (force → JS); if it still fails, `navigate` to the direct URL |
+| `screenshot` LLM can't "see" the image | returning a base64 data-URI inside a JSON string | return an `ImageContent` content block (LLM renders it); base64-in-JSON text is invisible to the LLM |
+| `screenshot` returns a JSON string (no image block) | image exceeded the 1.5 MB inline cap | open the saved `path`, or retry with a smaller `max_dim` (e.g. 512) |
 
 ## File Structure
 
 ```
 browseTheNet.py
-├── Imports
+├── Imports (+ optional trafilatura)
+├── Constants (_UA, _TIMEOUT_MS, _COOKIE_SELECTORS)
 ├── Session Registry (_sessions, _sessions_lock, _SESSION_TIMEOUT)
-├── Core Session Functions
-│   ├── _cleanup_expired_sessions()
-│   ├── _destroy_session()
-│   └── _validate_session()
-├── Stateless Tools
-│   ├── basic_page_fetch()
-│   ├── fetch_page_sections()
-│   ├── fetch_page_progressive()
-│   └── fetch_page_section_by_id()
-├── Stateful Tools
-│   ├── browser_open()
-│   ├── browser_navigate()
-│   ├── browser_click()
-│   ├── browser_fill()
-│   ├── browser_get_state()
-│   ├── browser_go_back()
-│   ├── browser_go_forward()
-│   ├── browser_screenshot()
-│   └── browser_close()
-├── Internal Helpers
-│   ├── _extract_sections()
-│   └── _classify()
+├── Shared Helpers
+│   ├── _extract_article()   # trafilatura → bs4 fallback
+│   ├── _bs4_extract()
+│   ├── _ok() / _err()       # uniform JSON response builders
+│   ├── _as_selector()
+│   ├── _robust_click()      # click fallback: normal → force → JS
+│   ├── _compress_screenshot()  # PNG → JPEG (max_dim clamp 100–4096, quality clamp 1–100)
+│   ├── _do_screenshot()     # [ImageContent, TextContent] + saved file (1.5 MB cap → JSON-string fallback)
+│   ├── _MAX_INLINE_BYTES    # 1,500,000 — hard cap on inline screenshot payload
+│   ├── _fetch_http()
+│   ├── _dismiss_cookie_banner()
+│   ├── _render_playwright()
+│   ├── _read_live_page()
+│   ├── _get_session()
+│   └── _destroy_session()
+├── Tools
+│   ├── webreader_read()
+│   ├── webreader_search()
+│   ├── webreader_open()
+│   ├── webreader_act()
+│   └── webreader_close()
 └── if __name__ == "__main__": mcp.run()
 ```
 
@@ -294,17 +243,41 @@ fastmcp
 playwright
 httpx
 beautifulsoup4
+trafilatura
 ```
 
 Install Playwright browsers:
 ```bash
-playwright install chromium
+/home/user2/Documents/workspace/code/venv/bin/python -m playwright install chromium
 ```
 
 ## Running
 
 ```bash
-python browseTheNet.py
+/home/user2/Documents/workspace/code/venv/bin/python browseTheNet.py
 ```
 
 Or import as an MCP server in your application.
+
+## Manual Testing Workflow
+
+```python
+# 1. Read a page (the default path)
+webreader_read("https://ltx.io/blog/ltx-2-5-prompt-guide")
+
+# 2. Search (best-effort)
+webreader_search("ltx-2.5 prompting guide")
+
+# 3. Interactive session
+res = webreader_open("https://example.com")
+sid = json.loads(res)["session_id"]
+webreader_act(sid, "click", selector="Sign in")      # visible text or CSS selector
+webreader_act(sid, "fill", selector="#email", value="a@b.com")
+webreader_act(sid, "read")                            # extract current page
+webreader_act(sid, "screenshot")                      # image content block + saved temp file
+webreader_act(sid, "screenshot", path="shot.png")     # also save to a specific path
+webreader_act(sid, "screenshot", max_dim=512)         # smaller image (default 768)
+webreader_act(sid, "screenshot", full_page=True)      # whole scrollable page
+webreader_act(sid, "scroll", direction="down")        # scroll the page
+webreader_close(sid)
+```

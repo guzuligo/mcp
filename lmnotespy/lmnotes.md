@@ -315,6 +315,27 @@ Copies a file from anywhere on the filesystem into the references folder. **Requ
 
 Returns: dict with status, filename, and note data. Internal paths hidden by default — visible only when `DEBUG = True`.
 
+#### `move_note(note_id: str, destination_folder: str, new_title: str = None) -> dict`
+Move a note from one folder to another. Creates a new note in the destination folder
+with the same content, re-parents child notes, and writes a redirect stub in the old
+location. **Requires init to be called first.**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `note_id` | str | The ID of the note to move (e.g., "260729165500") |
+| `destination_folder` | str | Target folder — one of: procedures, reports, individuals, conversations, knowledge, system, references |
+| `new_title` | str (optional) | New title for the note. Keeps existing title if omitted. |
+
+**Behavior:**
+1. Finds the note and reads its content.
+2. Creates a new note in the destination folder (preserving ID, tags, parent_id).
+3. Re-parents any child notes that reference this note as their parent.
+4. Writes a redirect stub to the old file location (instead of deleting it).
+5. Updates the source folder index, destination index, and root index.
+6. Commits to git with message "Move note {id}: {old} → {new}".
+
+Returns: dict with status, old_folder, new_folder, id, filenames, and optionally reparented_count.
+
 ---
 
 ## Parent/Children Reference System

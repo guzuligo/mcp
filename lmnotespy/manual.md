@@ -40,6 +40,7 @@
 - `lmnotes_append_to_note(note_id, addition)` — append with separator
 - `lmnotes_delete_note(note_id)` — delete note and update index
 - `lmnotes_copy_to_references(source_path, description)` — copy external file
+- `lmnotes_move_note(note_id, destination_folder)` — move note to another folder
 
 ### Git Integration (Automatic)
 Every write operation auto-commits. Additional tools:
@@ -218,6 +219,30 @@ Copy a file from anywhere on the filesystem into the references folder.
 - `note_id` (str): Custom ID for the reference note
 **Returns:**
 - JSON with status, destination path, and note data.
+
+## Tool: lmnotes_move_note
+Move a note from one folder to another. Creates a new note in the destination
+folder with the same content, re-parents any child notes, and writes a redirect
+stub in the old location (instead of deleting it) so the LLM can see what was
+moved and where it went.
+
+**Args:**
+- `note_id` (str): The ID of the note to move (e.g., "260729165500")
+- `destination_folder` (str): Target folder — one of: procedures, reports,
+  individuals, conversations, knowledge, system, references
+- `new_title` (str, optional): New title for the note. Keeps existing title if empty.
+**Returns:**
+- JSON with status, old_folder, new_folder, id, filenames, and optionally
+  reparented_count.
+**Behavior:**
+1. Finds the note and reads its content.
+2. Creates a new note in the destination folder (preserving ID, tags, parent_id).
+3. Re-parents any child notes that reference this note as their parent.
+4. Writes a redirect stub to the old file location with the new path.
+5. Updates the source folder index, destination index, and root index.
+6. Commits to git with message "Move note {id}: {old} → {new}".
+**Example:**
+- `move_note(note_id="260729165500", destination_folder="knowledge")`
 
 ## Tool: lmnotes_git_log
 Return commit history for a specific note.

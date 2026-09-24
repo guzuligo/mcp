@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from lmnotes.notebook import Notebook
+    from lmnotespy.notebook import Notebook
 
 
 class GitService:
@@ -125,7 +125,7 @@ class GitService:
             return {"status": "success", "note_id": note_id, "commits": [], "message": "Git not initialized in this notebook."}
 
         # Import here to avoid circular dependency at module level
-        from lmnotes.utils import find_note_file  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import find_note_file  # pylint: disable=import-outside-toplevel
         filepath = find_note_file(self.nb, note_id, "")
         if not filepath:
             for f in root.rglob(f"*{note_id}*.md"):
@@ -159,7 +159,7 @@ class GitService:
         if not git_dir.exists():
             return {"status": "success", "note_id": note_id, "diff": "", "message": "Git not initialized."}
 
-        from lmnotes.utils import find_note_file  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import find_note_file  # pylint: disable=import-outside-toplevel
         filepath = find_note_file(self.nb, note_id, "")
         if not filepath:
             for f in root.rglob(f"*{note_id}*.md"):
@@ -195,7 +195,7 @@ class GitService:
         if not git_dir.exists():
             return {"status": "error", "message": "Git not initialized in this notebook."}
 
-        from lmnotes.utils import find_note_file  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import find_note_file  # pylint: disable=import-outside-toplevel
         filepath = find_note_file(self.nb, note_id, "")
         if not filepath:
             for f in root.rglob(f"*{note_id}*.md"):
@@ -212,7 +212,7 @@ class GitService:
                 cwd=str(root), capture_output=True, check=True
             )
             # Update indexes after checkout
-            from lmnotes.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
+            from lmnotespy.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
             folder = filepath.parent.name if filepath.parent != root else ""
             if folder in VALID_FOLDERS:
                 self.nb._update_index(folder)

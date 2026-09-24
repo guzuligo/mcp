@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import re
 
 if TYPE_CHECKING:
-    from lmnotes.notebook import Notebook
+    from lmnotespy.notebook import Notebook
 
 
 class OperationsService:
@@ -22,19 +22,13 @@ class OperationsService:
 
     def require_initialized(self) -> Optional[dict]:
         """Return an error dict if the notebook has not been initialized, else None."""
-        # pylint: disable=import-outside-toplevel
-        from lmnotes.notebook import _current_session, _sessions
-        
-        # Check if a session is active
-        if _current_session == "000" or _current_session not in _sessions:
-            return {"status": "error", "message": "Notebook not initialized. Call lmnotes_init_notebook first."}
-        
-        return None
+        from lmnotespy.notebook import require_initialized as _req
+        return _req()
 
     def write_root_index(self) -> None:
         """Write or update the root index.md."""
         root = Path(self.nb.folder)
-        from lmnotes.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
         content = "# LMNotes - Root Index\n\n## Categories\n\n"
         for folder in VALID_FOLDERS:
             folder_path = root / folder
@@ -51,7 +45,7 @@ class OperationsService:
         if not folder_path.exists():
             return
         
-        from lmnotes.utils import parse_frontmatter  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import parse_frontmatter  # pylint: disable=import-outside-toplevel
         notes = []
         for f in sorted(folder_path.glob("*.md")):
             if f.name == "index.md":
@@ -81,7 +75,7 @@ class OperationsService:
         lines.extend([
             "",
             "---",
-            f"*Search hint: use `search_notes` with folder=\"{folder}\" to find by keyword*",
+            f'*Search hint: use `search_notes` with folder="{folder}" to find by keyword*',
             ""
         ])
         
@@ -90,7 +84,7 @@ class OperationsService:
     def _count_children(self, parent_id: str) -> int:
         """Count how many notes reference the given ID as their parent."""
         root = Path(self.nb.folder)
-        from lmnotes.utils import parse_frontmatter, VALID_FOLDERS  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import parse_frontmatter, VALID_FOLDERS  # pylint: disable=import-outside-toplevel
         count = 0
         for folder_name in VALID_FOLDERS:
             search_path = root / folder_name
@@ -121,10 +115,10 @@ class OperationsService:
             parent_id: Optional parent note ID for hierarchical links
         """
         # pylint: disable=import-outside-toplevel,global-statement
-        import lmnotes as _lmn
-        from lmnotes.utils import (  # noqa: F401
+        from lmnotespy import notebook as _nb
+        from lmnotespy.utils import (  # noqa: F401
             generate_id, make_slug, build_frontmatter, find_note_file,
-            ensure_ready, VALID_FOLDERS
+            ensure_ready, VALID_FOLDERS, generate_unique_id, _note_id_in_use
         )
         
         err = self.require_initialized()
@@ -139,11 +133,19 @@ class OperationsService:
                 return {"status": "error", "message": f"Parent note with ID '{parent_id}' not found"}
         
         # Note: self.nb.folder is already set from create_notebook() which uses the session's folder
-        # No need to check _notebook_folder lambda anymore
         ensure_ready(Path(self.nb.folder), subfolder=folder)
         
+        root = Path(self.nb.folder)
         now = datetime.now(timezone.utc)
-        ts_id = note_id if note_id else generate_id(now)
+        
+        if note_id:
+            # Explicit custom ID — reject collision (fail-loud for user input)
+            if _note_id_in_use(root, note_id):
+                return {"status": "error", "message": f"Note ID '{note_id}' already exists"}
+            ts_id = note_id
+        else:
+            ts_id = generate_unique_id(root, now)
+        
         slug = make_slug(title, ts_id)
         filename = f"{ts_id}_{slug}.md"
         
@@ -180,14 +182,16 @@ class OperationsService:
             "created": data["created"],
             "updated": data["updated"]
         }
-        if _lmn.DEBUG:
+        if parent_id:
+            result["parent_id"] = parent_id
+        if _nb.DEBUG:
             result["filepath"] = str(filepath)
         return result
 
     def read_note(self, note_id: str, detail_level: int = 1) -> dict:
         """Read a note by its ID."""
         # pylint: disable=import-outside-toplevel
-        from lmnotes.utils import parse_frontmatter, find_note_file, read_note_file  # noqa: F401
+        from lmnotespy.utils import parse_frontmatter, find_note_file, read_note_file  # noqa: F401
         
         err = self.require_initialized()
         if err:
@@ -195,7 +199,7 @@ class OperationsService:
         filepath = find_note_file(self.nb, note_id, "")
         if not filepath:
             root = Path(self.nb.folder)
-            from lmnotes.utils import VALID_FOLDERS  # noqa: F401
+            from lmnotespy.utils import VALID_FOLDERS  # noqa: F401
             for folder_name in VALID_FOLDERS + ["", "."]:
                 search_path = root / folder_name if folder_name else root
                 if not search_path.exists():
@@ -253,7 +257,7 @@ class OperationsService:
                      max_tokens: int = 4096) -> dict:
         """Search notes by keywords with ranking based on match count."""
         # pylint: disable=import-outside-toplevel
-        from lmnotes.utils import parse_frontmatter, read_note_file, VALID_FOLDERS  # noqa: F401
+        from lmnotespy.utils import parse_frontmatter, read_note_file, VALID_FOLDERS  # noqa: F401
         
         err = self.require_initialized()
         if err:
@@ -369,8 +373,8 @@ class OperationsService:
     def list_folder(self, folder: str = None) -> dict:
         """List contents of a folder as structured rows."""
         # pylint: disable=import-outside-toplevel
-        import lmnotes as _lmn
-        from lmnotes.utils import parse_frontmatter, VALID_FOLDERS  # noqa: F401
+        from lmnotespy import notebook as _nb
+        from lmnotespy.utils import parse_frontmatter, VALID_FOLDERS  # noqa: F401
         
         err = self.require_initialized()
         if err:
@@ -414,7 +418,7 @@ class OperationsService:
                     "created": fm.get("created", "")[:10] if fm.get("created") else "",
                     "updated": fm.get("updated", "")[:10] if fm.get("updated") else ""
                 }
-                if _lmn.DEBUG:
+                if _nb.DEBUG:
                     note_row["filepath"] = str(f)
                 notes.append(note_row)
             
@@ -428,7 +432,7 @@ class OperationsService:
     def list_children(self, note_id: str) -> dict:
         """List all notes that reference the given ID as their parent."""
         # pylint: disable=import-outside-toplevel
-        from lmnotes.utils import parse_frontmatter, find_note_file, VALID_FOLDERS  # noqa: F401
+        from lmnotespy.utils import parse_frontmatter, find_note_file, VALID_FOLDERS  # noqa: F401
         
         err = self.require_initialized()
         if err:
@@ -483,7 +487,7 @@ class OperationsService:
                    detail_level: int = 1, max_results: int = 50) -> dict:
         """List all notes as structured rows (database-style table view)."""
         # pylint: disable=import-outside-toplevel
-        from lmnotes.utils import parse_frontmatter, find_note_file, VALID_FOLDERS  # noqa: F401
+        from lmnotespy.utils import parse_frontmatter, find_note_file, VALID_FOLDERS  # noqa: F401
         
         err = self.require_initialized()
         if err:
@@ -583,8 +587,8 @@ class OperationsService:
     def get_stats(self) -> dict:
         """Return notebook statistics."""
         # pylint: disable=import-outside-toplevel
-        import lmnotes as _lmn
-        from lmnotes.utils import VALID_FOLDERS  # noqa: F401
+        from lmnotespy import notebook as _nb
+        from lmnotespy.utils import VALID_FOLDERS  # noqa: F401
         
         err = self.require_initialized()
         if err:
@@ -601,7 +605,7 @@ class OperationsService:
                 stats["total_notes"] += count
         
         result = {"status": "success", "total_notes": stats["total_notes"], "folders": stats["folders"]}
-        if _lmn.DEBUG:
+        if _nb.DEBUG:
             result["notebook_folder"] = str(root)
         return result
 
@@ -618,12 +622,12 @@ class OperationsService:
         if not system_path.exists():
             return result
         
-        from lmnotes.utils import read_note_file  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import read_note_file  # pylint: disable=import-outside-toplevel
         core_file = system_path / "000000000000_core_prompt.md"
         if core_file.exists():
             result["core_prompt"] = core_file.read_text(encoding="utf-8")
         
-        from lmnotes.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
+        from lmnotespy.utils import VALID_FOLDERS  # pylint: disable=import-outside-toplevel
         for f in sorted(system_path.glob("*.md")):
             if f.name == "index.md" or f.name == "000000000000_core_prompt.md":
                 continue

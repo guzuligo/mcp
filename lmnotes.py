@@ -5,7 +5,7 @@ A pure file-based notebook management system using hierarchical index.md files
 for navigation and search. All notes are stored as human-readable markdown files.
 
 This is the main entry point for the MCP server. The core Notebook class and
-business logic are in the lmnotes/ package (modular architecture).
+business logic are in the lmnotespy/ package (modular architecture).
 
 Folder Structure:
     ~/.lmnotes/
@@ -46,25 +46,20 @@ except ImportError:
 # exactly ONE copy of each variable. When init_session sets a session in
 # notebook.py, lmnotes.py sees the same change automatically.
 
-from lmnotes import notebook as _nb  # noqa: E402
-from lmnotes.notebook import (
+from lmnotespy import notebook as _nb  # noqa: E402
+from lmnotespy.notebook import (
     Notebook,
     create_notebook,
     init_session,
-    reinit_session,
     get_session,
     list_sessions,
     close_session,
     DEBUG,
     VALID_FOLDERS,
-    MAX_SESSIONS,
 )
+from lmnotespy import notebook as _nb_mod  # noqa: F811
+from lmnotespy.sessions import _get_conn, _resolve_db_path
 
-# LIVE REFERENCES to notebook.py's module variables (functions, not values)
-_initialized = _nb._initialized  # lambda function
-_notebook_folder = _nb._notebook_folder  # lambda function
-_selection_store = _nb._selection_store
-_selection_counter = _nb._selection_counter
 
 _mcp_instance = None
 
@@ -84,9 +79,10 @@ def _tool_run(func, *args, **kwargs) -> str:
     except AttributeError as e:
         # create_notebook() returns None when not initialized,
         # and .method() on None raises AttributeError
-        if not _initialized:
+        err = _nb_mod.require_initialized()
+        if err is not None:
             return json.dumps(
-                {"status": "error", "message": "Notebook not initialized. Call lmnotes_init_notebook first."},
+                {"status": "error", "message": "No active session. Call lmnotes_init_notebook first."},
                 indent=2
             )
         return json.dumps(
@@ -94,9 +90,10 @@ def _tool_run(func, *args, **kwargs) -> str:
             indent=2
         )
     if result is None:
-        if not _initialized:
+        err = _nb_mod.require_initialized()
+        if err is not None:
             return json.dumps(
-                {"status": "error", "message": "Notebook not initialized. Call lmnotes_init_notebook first."},
+                {"status": "error", "message": "No active session. Call lmnotes_init_notebook first."},
                 indent=2
             )
         return json.dumps({"status": "error", "message": "Not initialized"}, indent=2)
@@ -107,14 +104,26 @@ def _tool_run(func, *args, **kwargs) -> str:
 # MCP Server Setup
 # ============================================================================
 
-mcp = _get_mcp()
+try:
+    mcp = _get_mcp()
+except (TypeError, NameError):
+    # FastMCP not installed - mcp will be None
+    mcp = None  # type: ignore
+
+
+# Conditional decorator: only register with MCP if mcp is available
+def _tool(f):
+    """Register function as MCP tool if mcp server exists."""
+    if mcp is not None:
+        return mcp.tool(f)
+    return f
 
 
 # ============================================================================
 # MCP Tools (27 tools with full docstrings)
 # ============================================================================
 
-@mcp.tool
+@_tool
 def lmnotes_init_notebook(folder: str = "") -> str:
     """Initialize a new session with the given notebook folder.
 
@@ -136,25 +145,7 @@ def lmnotes_init_notebook(folder: str = "") -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool
-def lmnotes_reinit_session(session_id: str, folder: str = "") -> str:
-    """Reinitialize an existing session with a new folder.
-
-    Changes the notebook folder for the specified session and switches
-    to that session. The session_id remains the same.
-
-    Args:
-        session_id: The session to reinitialize (e.g., "001", "042")
-        folder: New notebook folder path. If empty, uses default ~/.lmnotes/
-
-    Returns:
-        JSON with status, session_id, and new folder path.
-    """
-    result = reinit_session(session_id, folder if folder else None)
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool
+@_tool
 def lmnotes_get_session() -> str:
     """Return the current session information.
 
@@ -167,7 +158,7 @@ def lmnotes_get_session() -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool
+@_tool
 def lmnotes_list_sessions() -> str:
     """List all active sessions with their folders.
 
@@ -181,15 +172,15 @@ def lmnotes_list_sessions() -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool
+@_tool
 def lmnotes_close_session(session_id: str) -> str:
     """Close a session and free its slot.
 
     Removes the specified session. If the closed session was the active one,
-    the current session is reset to "000" (no session).
+    the current session is cleared.
 
     Args:
-        session_id: The session to close (e.g., "001", "042")
+        session_id: The session to close (e.g., "260828151012")
 
     Returns:
         JSON with status and message.
@@ -198,7 +189,7 @@ def lmnotes_close_session(session_id: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool
+@_tool
 def lmnotes_create_note(title: str, content: str, folder: str, tags: str = "",
                         note_id: str = "", parent_id: str = "") -> str:
     """Create a new note file with the given title, content, and metadata.
@@ -226,7 +217,7 @@ def lmnotes_create_note(title: str, content: str, folder: str, tags: str = "",
     )
 
 
-@mcp.tool
+@_tool
 def lmnotes_read_note(note_id: str, detail_level: int = 1) -> str:
     """Read a note by its ID.
 
@@ -241,7 +232,7 @@ def lmnotes_read_note(note_id: str, detail_level: int = 1) -> str:
     return _tool_run(lambda: create_notebook().read_note(note_id, detail_level))
 
 
-@mcp.tool
+@_tool
 def lmnotes_search_notes(keywords: str, folder: str = "", detail_level: int = 1,
                          max_results: int = 20, max_tokens: int = 4096) -> str:
     """Search notes by keywords with ranking based on match count.
@@ -267,7 +258,7 @@ def lmnotes_search_notes(keywords: str, folder: str = "", detail_level: int = 1,
     )
 
 
-@mcp.tool
+@_tool
 def lmnotes_list_notes(folder: str = "", detail_level: int = 1, max_results: int = 50) -> str:
     """List all notes as structured rows (database-style table view).
 
@@ -286,7 +277,7 @@ def lmnotes_list_notes(folder: str = "", detail_level: int = 1, max_results: int
                                                            detail_level, max_results))
 
 
-@mcp.tool
+@_tool
 def lmnotes_list_children(note_id: str) -> str:
     """List all child notes under a parent note.
 
@@ -302,7 +293,7 @@ def lmnotes_list_children(note_id: str) -> str:
     return _tool_run(lambda: create_notebook().list_children(note_id))
 
 
-@mcp.tool
+@_tool
 def lmnotes_list_folder(folder: str = "") -> str:
     """List contents of a specific folder as structured rows.
 
@@ -316,7 +307,7 @@ def lmnotes_list_folder(folder: str = "") -> str:
     return _tool_run(lambda: create_notebook().list_folder(folder if folder else None))
 
 
-@mcp.tool
+@_tool
 def lmnotes_read_index(folder: str = "") -> str:
     """Read an index.md file for navigation.
 
@@ -331,7 +322,7 @@ def lmnotes_read_index(folder: str = "") -> str:
     return _tool_run(lambda: create_notebook().read_index(folder if folder else None))
 
 
-@mcp.tool
+@_tool
 def lmnotes_update_note(note_id: str, title: str = "", tags: str = "",
                         content: str = "") -> str:
     """Update an existing note's fields. Content is replaced entirely.
@@ -354,7 +345,7 @@ def lmnotes_update_note(note_id: str, title: str = "", tags: str = "",
     )
 
 
-@mcp.tool
+@_tool
 def lmnotes_append_to_note(note_id: str, addition: str,
                            separator: str = "\n\n---\n\n") -> str:
     """Append text to an existing note's content.
@@ -370,7 +361,7 @@ def lmnotes_append_to_note(note_id: str, addition: str,
     return _tool_run(lambda: create_notebook().append_to_note(note_id, addition, separator))
 
 
-@mcp.tool
+@_tool
 def lmnotes_select_note(note_id: str, pattern: str = "", mode: str = "exact",
                         start_line: int = 1, end_line: int = -1) -> str:
     """Select/search text within a note for editing.
@@ -394,7 +385,7 @@ def lmnotes_select_note(note_id: str, pattern: str = "", mode: str = "exact",
     )
 
 
-@mcp.tool
+@_tool
 def lmnotes_edit_selection(selection_id: str, replacement: str = "",
                            occurrence: int = 0) -> str:
     """Edit text based on a previous selection. Selection is nullified after editing.
@@ -413,7 +404,7 @@ def lmnotes_edit_selection(selection_id: str, replacement: str = "",
     )
 
 
-@mcp.tool
+@_tool
 def lmnotes_delete_selection(selection_id: str, occurrence: int = 0) -> str:
     """Delete text based on a previous selection. Selection is nullified after editing.
 
@@ -427,7 +418,7 @@ def lmnotes_delete_selection(selection_id: str, occurrence: int = 0) -> str:
     return _tool_run(lambda: create_notebook().delete_selection(selection_id, occurrence))
 
 
-@mcp.tool
+@_tool
 def lmnotes_append_selection(selection_id: str, addition: str = "",
                              occurrence: int = 0) -> str:
     """Append text after previously selected matches. Selection is nullified.
@@ -446,7 +437,7 @@ def lmnotes_append_selection(selection_id: str, addition: str = "",
     )
 
 
-@mcp.tool
+@_tool
 def lmnotes_delete_note(note_id: str) -> str:
     """Delete a note file and update the parent index.
 
@@ -459,7 +450,7 @@ def lmnotes_delete_note(note_id: str) -> str:
     return _tool_run(lambda: create_notebook().delete_note(note_id))
 
 
-@mcp.tool
+@_tool
 def lmnotes_get_stats() -> str:
     """Return notebook statistics (counts per folder, total notes).
 
@@ -469,7 +460,7 @@ def lmnotes_get_stats() -> str:
     return _tool_run(lambda: create_notebook().get_stats())
 
 
-@mcp.tool
+@_tool
 def lmnotes_read_system_prompt() -> str:
     """Read system folder prompts. Returns the core prompt and any additional notes.
 
@@ -481,7 +472,7 @@ def lmnotes_read_system_prompt() -> str:
     return _tool_run(lambda: create_notebook().read_system_prompt())
 
 
-@mcp.tool
+@_tool
 def lmnotes_copy_to_references(source_path: str, description: str = "",
                                 note_id: str = "") -> str:
     """Copy a file from anywhere on the filesystem into the references folder.
@@ -503,7 +494,33 @@ def lmnotes_copy_to_references(source_path: str, description: str = "",
     )
 
 
-@mcp.tool
+@_tool
+def lmnotes_move_note(note_id: str, destination_folder: str, 
+                      new_title: str = "") -> str:
+    """Move a note from one folder to another.
+    
+    Creates a new note in the destination folder with the same content,
+    re-parents any child notes, and writes a redirect stub in the old
+    location (instead of deleting it) so the LLM can see what was moved
+    and where it went.
+    
+    Args:
+        note_id: The ID of the note to move (e.g., "260729165500")
+        destination_folder: Target folder name (procedures, reports, 
+            individuals, conversations, knowledge, system, references)
+        new_title: Optional new title for the note (keeps existing title if empty)
+    
+    Returns:
+        JSON with status, old_folder, new_folder, id, filenames, and
+        optionally reparented_count.
+    """
+    return _tool_run(
+        lambda: create_notebook().move_note(
+            note_id, destination_folder, new_title if new_title else None)
+    )
+
+
+@_tool
 def lmnotes_git_log(note_id: str) -> str:
     """Return commit history for a specific note.
 
@@ -519,7 +536,7 @@ def lmnotes_git_log(note_id: str) -> str:
     return _tool_run(lambda: create_notebook().git_log(note_id))
 
 
-@mcp.tool
+@_tool
 def lmnotes_git_diff(note_id: str, from_rev: str = "", to_rev: str = "") -> str:
     """Show diff between two revisions of a note.
 
@@ -538,7 +555,7 @@ def lmnotes_git_diff(note_id: str, from_rev: str = "", to_rev: str = "") -> str:
     )
 
 
-@mcp.tool
+@_tool
 def lmnotes_git_checkout(note_id: str, revision: str) -> str:
     """Restore a note to a previous git revision.
 
@@ -555,7 +572,7 @@ def lmnotes_git_checkout(note_id: str, revision: str) -> str:
     return _tool_run(lambda: create_notebook().git_checkout(note_id, revision))
 
 
-@mcp.tool
+@_tool
 def lmnotes_manual(tool_name: str = "") -> str:
     """Return documentation for a specific tool or general usage guide.
 
@@ -607,14 +624,11 @@ Folder Categories:
 
 
 def _setup_folder_from_cli():
-    """Set up the notebook folder from CLI arguments and set the global."""
+    """Set up the notebook folder from CLI arguments and create a session."""
     args = _parse_args()
     if args.folder:
-        nb = Notebook(args.folder)
-        # This sets notebook.py's _notebook_folder (we imported by reference)
-        global _notebook_folder
-        _notebook_folder = str(nb.folder)
-        return _notebook_folder
+        result = init_session(args.folder)
+        return result.get("folder")
     return None
 
 
@@ -635,7 +649,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("Available tools:")
     print("Session Management:")
-    print("  lmnotes_init_notebook      - Initialize a new session (001-999)")
+    print("  lmnotes_init_notebook      - Initialize a new session (persistent SQLite)")
     print("  lmnotes_reinit_session     - Reinitialize session with new folder")
     print("  lmnotes_get_session        - Get current session info")
     print("  lmnotes_list_sessions      - List all active sessions")
@@ -659,6 +673,7 @@ if __name__ == "__main__":
     print("  lmnotes_get_stats          - View notebook statistics")
     print("  lmnotes_read_system_prompt - Read system prompts")
     print("  lmnotes_copy_to_references - Copy external file to references")
+    print("  lmnotes_move_note          - Move note to a different folder")
     print("  lmnotes_git_log            - Show commit history for a note")
     print("  lmnotes_git_diff           - Diff between two revisions of a note")
     print("  lmnotes_git_checkout       - Restore a note to a previous revision")
